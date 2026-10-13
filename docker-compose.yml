@@ -1,0 +1,65 @@
+# The Hostly sync server: PostgreSQL plus the API, optionally behind Caddy for HTTPS.
+#
+#   docker compose up -d --build                    # local:  http://127.0.0.1:8080
+#   docker compose --profile https up -d --build    # public: https://$HOSTLY_DOMAIN
+#
+# Every setting has a local default and can be overridden in .env (see .env.example).
+# For a public server, set POSTGRES_PASSWORD and HOSTLY_DOMAIN there first.
+name: hostly
+
+services:
+  postgres:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-hostly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hostly}
+      POSTGRES_DB: ${POSTGRES_DB:-hostly}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # No published port: only the server reaches the database.
+
+  server:
+    build:
+      context: .
+      dockerfile: crates/hostly-server/Dockerfile
+    image: hostly-server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-hostly}:${POSTGRES_PASSWORD:-hostly}@postgres:5432/${POSTGRES_DB:-hostly}
+      RUST_LOG: ${RUST_LOG:-hostly_server=info,tower_http=info}
+    ports:
+      # Where the API is reachable on this machine. Behind Caddy (or another
+      # reverse proxy on the same machine) keep it on 127.0.0.1.
+      - ${HOSTLY_PUBLISH:-127.0.0.1:8080}:8080
+
+  # HTTPS with automatic Let's Encrypt certificates for HOSTLY_DOMAIN. Needs DNS
+  # for that domain pointing at this machine, and ports 80 and 443 open.
+  caddy:
+    image: caddy:2
+    profiles: [https]
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      HOSTLY_DOMAIN: ${HOSTLY_DOMAIN:-}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  postgres-data:
+  caddy-data:
+  caddy-config:

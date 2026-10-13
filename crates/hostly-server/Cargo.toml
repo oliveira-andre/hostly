@@ -1,0 +1,26 @@
+[package]
+name = "hostly-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.6.0"
+axum = { version = "0.8.9", features = ["macros"] }
+base64 = "0.23.1"
+dotenvy = "0.15.7"
+getrandom = "0.4.3"
+hostly-protocol = { version = "0.1.0", path = "../hostly-protocol" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.0"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "migrate", "macros", "json"] }
+tokio = { version = "1.53.2", features = ["full"] }
+tower-http = { version = "0.7.1", features = ["trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+hostly-core = { path = "../hostly-core" }
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }
+tempfile = "3.27.0"

@@ -1,0 +1,20 @@
+[package]
+name = "hostly-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hostly-protocol = { version = "0.1.0", path = "../hostly-protocol" }
+keyring = "4.2.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "http2"] }
+russh = "0.64.1"
+russh-sftp = "3.0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
+uuid = { version = "1.28.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+rand = { version = "0.10", features = ["thread_rng"] }
+tempfile = "3.27.0"

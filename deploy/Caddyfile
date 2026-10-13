@@ -1,0 +1,5 @@
+# Used by the `https` profile in docker-compose.yml: terminates TLS for
+# HOSTLY_DOMAIN with an automatic certificate and forwards to the API.
+{$HOSTLY_DOMAIN} {
+	reverse_proxy server:8080
+}

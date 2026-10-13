@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Hostly: a terminal prompt inside a cloud, on the DESIGN.md night background. -->
+  <rect width="1024" height="1024" rx="230" fill="#22212C"/>
+  <g transform="translate(128 128) scale(32)">
+    <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" fill="#9580FF"/>
+    <path d="M7.75 11 10.25 13.25 7.75 15.5M12.25 15.5h4" fill="none" stroke="#22212C" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

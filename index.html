@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hostly</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <header class="sidebar-header">
+          <span class="brand">
+            <svg class="brand-mark" viewBox="2 4 21 17" aria-hidden="true">
+              <path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" fill="#9580FF" />
+              <path d="M7.75 11 10.25 13.25 7.75 15.5M12.25 15.5h4" fill="none" stroke="#22212C" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            Hostly
+          </span>
+          <button id="new-host" class="icon-button round" type="button" title="New host" aria-label="New host">
+            <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+          </button>
+        </header>
+        <input id="host-filter" class="search" type="search" placeholder="Search hosts" autocomplete="off" spellcheck="false" />
+        <nav id="host-list" class="host-list" aria-label="Saved hosts"></nav>
+      </aside>
+
+      <main class="workspace">
+        <div class="tab-bar">
+          <div id="tabs" class="tabs" role="tablist"></div>
+          <div id="tab-actions" class="tab-actions"></div>
+          <button id="settings-button" class="profile-button" type="button" title="Settings" aria-label="Settings"></button>
+          <button id="profile-button" class="profile-button" type="button" aria-label="Account"></button>
+        </div>
+        <div id="tab-bodies" class="tab-bodies">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-card">
+              <h1>No open sessions</h1>
+              <p>Click a host to open a connection. Every click opens another one.</p>
+              <ul id="shortcut-list" class="shortcut-list"></ul>
+            </div>
+          </div>
+        </div>
+        <section id="page" class="page" hidden></section>
+      </main>
+    </div>
+
+    <dialog id="host-dialog" class="dialog">
+      <form id="host-form" method="dialog">
+        <h2 id="host-dialog-title">New host</h2>
+        <label>Label <input name="label" placeholder="Production DB" /></label>
+        <div class="row">
+          <label class="grow">Hostname <input name="hostname" required placeholder="db.example.com" autocapitalize="off" spellcheck="false" /></label>
+          <label class="port">Port <input name="port" type="number" min="1" max="65535" value="22" required /></label>
+        </div>
+        <label>Username <input name="username" required autocapitalize="off" spellcheck="false" /></label>
+        <label>Group <input name="group" placeholder="Optional" /></label>
+        <label>
+          Authentication
+          <select name="authType">
+            <option value="password">Password</option>
+            <option value="key">Private key file</option>
+            <option value="agent">SSH agent</option>
+          </select>
+        </label>
+        <div data-auth="password">
+          <label>Password <input name="password" type="password" autocomplete="off" spellcheck="false" /></label>
+        </div>
+        <div data-auth="key">
+          <label>Private key path <input name="keyPath" placeholder="~/.ssh/id_ed25519" spellcheck="false" /></label>
+          <label>Passphrase <input name="passphrase" type="password" autocomplete="off" spellcheck="false" placeholder="Leave empty if the key has none" /></label>
+        </div>
+        <p data-auth="agent" class="hint">Uses the keys loaded in your SSH agent (<code>ssh-add -l</code>).</p>
+        <p class="hint">Passwords and passphrases are kept in the system keychain.</p>
+        <p id="host-form-error" class="form-error" role="alert"></p>
+        <menu>
+          <button type="button" class="button-secondary" data-close>Cancel</button>
+          <button type="submit" class="button-primary">Save</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="prompt-dialog" class="dialog">
+      <form method="dialog">
+        <h2 data-title></h2>
+        <p data-message class="message"></p>
+        <pre data-detail class="detail"></pre>
+        <input data-secret type="password" autocomplete="off" spellcheck="false" />
+        <input data-text type="text" autocomplete="off" spellcheck="false" />
+        <label class="checkbox" data-remember-row><input data-remember type="checkbox" checked /> Save in keychain</label>
+        <menu>
+          <button type="button" class="button-secondary" value="cancel" data-close>Cancel</button>
+          <button type="submit" class="button-primary" value="ok" data-confirm>OK</button>
+        </menu>
+      </form>
+    </dialog>
+  </body>
+</html>
