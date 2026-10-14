@@ -112,6 +112,8 @@ There are four pieces:
 
 - **`crates/hostly-protocol`** holds the contract: the `Host` model and the `/api/v1` JSON types. Its module doc has the endpoint table. The app and the server must both go through these types.
 - **`crates/hostly-server`** is the self-hosted API: axum and PostgreSQL. It's configured from `.env` (see `.env.example`).
+  - Log-ins are limited in `login_limits.rs`: per client address in memory, and per account in the `failed_logins` and `locked_until` columns. Each repeated lock lasts twice as long; a successful log-in resets it.
+  - The client address follows `X-Forwarded-For` only through loopback or private hops. So `app()` must be served with `into_make_service_with_connect_info::<SocketAddr>()`. Tests act as different clients by sending `X-Forwarded-For` from 127.0.0.1.
 - **`hostly-core::sync`** is the client engine:
   - `SyncFile` (`sync.json`) holds the login, the pull cursor, and `pending`: local changes the server hasn't accepted yet, recorded even while logged out.
   - `sync_once` runs one round: first merge (once per login) → push → pull.

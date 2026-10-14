@@ -1,10 +1,13 @@
 //! Accounts and bearer-token sessions.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use argon2::Argon2;
 use argon2::password_hash::phc::PasswordHash;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use axum::Json;
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{FromRef, FromRequestParts, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -16,6 +19,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::{ApiFailure, ApiJson};
+use crate::login_limits::{ClientIp, LoginGuard, LoginLimits, wait_text};
 
 const MAX_EMAIL_LEN: usize = 254;
 
@@ -59,17 +63,23 @@ pub async fn sign_up(
     ))
 }
 
-/// `POST /sessions`
+/// `POST /sessions`, within the [`LoginLimits`].
 pub async fn log_in(
     State(pool): State<PgPool>,
+    State(guard): State<Arc<LoginGuard>>,
+    ClientIp(client): ClientIp,
     ApiJson(credentials): ApiJson<Credentials>,
 ) -> Result<Json<Session>, ApiFailure> {
+    guard.begin(client)?;
     let email = credentials.email.trim().to_lowercase();
-    let account: Option<(Uuid, String)> =
-        sqlx::query_as("select id, password_hash from accounts where email = $1")
-            .bind(&email)
-            .fetch_optional(&pool)
-            .await?;
+    // `locked_for` is the seconds left on the account's lock, if any.
+    let account: Option<(Uuid, String, Option<f64>)> = sqlx::query_as(
+        "select id, password_hash, extract(epoch from locked_until - now())::float8
+         from accounts where email = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&pool)
+    .await?;
     let invalid = || {
         ApiFailure::new(
             StatusCode::UNAUTHORIZED,
@@ -77,12 +87,33 @@ pub async fn log_in(
             "wrong email or password",
         )
     };
-    let Some((id, password_hash)) = account else {
+    let Some((id, password_hash, locked_for)) = account else {
         return Err(invalid());
     };
+    if let Some(seconds) = locked_for.filter(|&seconds| seconds > 0.0) {
+        let wait = Duration::from_secs_f64(seconds);
+        return Err(ApiFailure::new(
+            StatusCode::LOCKED,
+            error_code::ACCOUNT_LOCKED,
+            format!(
+                "this account is locked after too many failed log-ins; try again in {}",
+                wait_text(wait)
+            ),
+        )
+        .retry_after(wait));
+    }
     if !verify_password(credentials.password, password_hash).await? {
+        record_failure(&pool, id, &guard.limits).await?;
         return Err(invalid());
     }
+    guard.succeeded(client);
+    sqlx::query(
+        "update accounts set failed_logins = 0, locked_until = null
+         where id = $1 and failed_logins > 0",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
     let token = create_session(&pool, id).await?;
     Ok(Json(Session {
         token,
@@ -123,10 +154,15 @@ pub struct Authenticated {
     token_hash: Vec<u8>,
 }
 
-impl FromRequestParts<PgPool> for Authenticated {
+impl<S> FromRequestParts<S> for Authenticated
+where
+    PgPool: FromRef<S>,
+    S: Send + Sync,
+{
     type Rejection = ApiFailure;
 
-    async fn from_request_parts(parts: &mut Parts, pool: &PgPool) -> Result<Self, ApiFailure> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiFailure> {
+        let pool = PgPool::from_ref(state);
         let token = parts
             .headers
             .get(AUTHORIZATION)
@@ -140,7 +176,7 @@ impl FromRequestParts<PgPool> for Authenticated {
             "update sessions set last_used_at = now() where token_hash = $1 returning account_id",
         )
         .bind(&token_hash)
-        .fetch_optional(pool)
+        .fetch_optional(&pool)
         .await?;
         let account_id = account_id.ok_or_else(ApiFailure::unauthorized)?;
         Ok(Self {
@@ -175,6 +211,37 @@ async fn create_session(pool: &PgPool, account_id: Uuid) -> Result<String, ApiFa
         .execute(pool)
         .await?;
     Ok(token)
+}
+
+/// Counts a wrong password for the account. Every `account_failures` of them in
+/// a row lock it, each lock twice as long as the one before.
+async fn record_failure(
+    pool: &PgPool,
+    account_id: Uuid,
+    limits: &LoginLimits,
+) -> Result<(), ApiFailure> {
+    let every = i32::try_from(limits.account_failures.max(1)).unwrap_or(i32::MAX);
+    let locked: bool = sqlx::query_scalar(
+        "update accounts set
+             failed_logins = failed_logins + 1,
+             locked_until = case when (failed_logins + 1) % $2 = 0
+                 then now() + make_interval(secs => least(
+                     $3::float8 * power(2::float8, least((failed_logins + 1) / $2 - 1, 30)),
+                     $4::float8))
+                 else locked_until end
+         where id = $1
+         returning failed_logins % $2 = 0",
+    )
+    .bind(account_id)
+    .bind(every)
+    .bind(limits.account_lock.as_secs_f64())
+    .bind(limits.max_account_lock.as_secs_f64())
+    .fetch_one(pool)
+    .await?;
+    if locked {
+        tracing::warn!(account = %account_id, "account locked after failed log-ins");
+    }
+    Ok(())
 }
 
 fn token_hash(token: &str) -> Vec<u8> {

@@ -14,6 +14,11 @@
 //!
 //! `GET /health` (outside `/api/v1`) answers 200 `ok`. Failures answer with an
 //! [`ApiError`] body; see [`error_code`] for the codes.
+//!
+//! `POST /sessions` is limited: too many failed log-ins from one address, or
+//! in a row for one account, are refused for a while (429
+//! [`error_code::TOO_MANY_ATTEMPTS`], 423 [`error_code::ACCOUNT_LOCKED`]). Both
+//! carry a `Retry-After` header in seconds.
 
 use std::path::PathBuf;
 
@@ -171,6 +176,11 @@ pub mod error_code {
     pub const INVALID_CREDENTIALS: &str = "invalidCredentials";
     /// 401: missing, unknown or revoked session token.
     pub const UNAUTHORIZED: &str = "unauthorized";
+    /// 429: too many failed log-ins from the client's address.
+    pub const TOO_MANY_ATTEMPTS: &str = "tooManyAttempts";
+    /// 423: the account is locked after too many failed log-ins in a row,
+    /// even for the right password.
+    pub const ACCOUNT_LOCKED: &str = "accountLocked";
     /// 500: anything else.
     pub const INTERNAL: &str = "internal";
 }

@@ -98,6 +98,8 @@ impl Error {
                 error_code::EMAIL_TAKEN => "emailTaken",
                 error_code::INVALID_CREDENTIALS => "invalidCredentials",
                 error_code::UNAUTHORIZED => "unauthorized",
+                error_code::TOO_MANY_ATTEMPTS => "tooManyAttempts",
+                error_code::ACCOUNT_LOCKED => "accountLocked",
                 _ => "api",
             },
             Error::NotLoggedIn => "notLoggedIn",

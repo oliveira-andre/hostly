@@ -1,3 +1,6 @@
+use std::net::SocketAddr;
+
+use hostly_server::LoginLimits;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -27,9 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(&bind).await?;
     tracing::info!("listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, hostly_server::app(pool))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let app = hostly_server::app(pool, LoginLimits::default());
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     Ok(())
 }
 

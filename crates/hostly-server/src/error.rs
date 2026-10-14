@@ -1,9 +1,11 @@
 use std::fmt::Display;
+use std::time::Duration;
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{FromRequest, FromRequestParts};
 use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
 use axum::response::{IntoResponse, Response};
 use hostly_protocol::{ApiError, error_code};
 
@@ -13,6 +15,7 @@ pub struct ApiFailure {
     status: StatusCode,
     code: &'static str,
     message: String,
+    retry_after: Option<Duration>,
 }
 
 impl ApiFailure {
@@ -21,7 +24,14 @@ impl ApiFailure {
             status,
             code,
             message: message.into(),
+            retry_after: None,
         }
+    }
+
+    /// Adds a `Retry-After` header, in whole seconds rounded up.
+    pub fn retry_after(mut self, wait: Duration) -> Self {
+        self.retry_after = Some(wait);
+        self
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
@@ -57,8 +67,19 @@ impl IntoResponse for ApiFailure {
             error: self.code.to_owned(),
             message: self.message,
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(wait) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, whole_seconds(wait).into());
+        }
+        response
     }
+}
+
+/// Rounds up, so a client that waits this long is never early.
+pub fn whole_seconds(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
 }
 
 impl From<sqlx::Error> for ApiFailure {

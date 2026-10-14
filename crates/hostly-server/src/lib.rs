@@ -4,19 +4,35 @@
 mod accounts;
 mod error;
 mod hosts;
+mod login_limits;
+
+use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::FromRef;
 use axum::routing::{delete, get, post};
 use hostly_protocol::API_PREFIX;
+use login_limits::LoginGuard;
 use sqlx::PgPool;
 use tower_http::trace::TraceLayer;
+
+pub use login_limits::LoginLimits;
 
 /// Applies the database migrations embedded from `migrations/`.
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
 }
 
-pub fn app(pool: PgPool) -> Router {
+#[derive(Clone, FromRef)]
+struct AppState {
+    pool: PgPool,
+    logins: Arc<LoginGuard>,
+}
+
+/// The server's routes. Serve them with
+/// `into_make_service_with_connect_info::<SocketAddr>()`: log-in limits need
+/// each client's address.
+pub fn app(pool: PgPool, limits: LoginLimits) -> Router {
     let api = Router::new()
         .route("/accounts", post(accounts::sign_up))
         .route("/sessions", post(accounts::log_in))
@@ -27,5 +43,8 @@ pub fn app(pool: PgPool) -> Router {
         .nest(API_PREFIX, api)
         .route("/health", get(|| async { "ok" }))
         .layer(TraceLayer::new_for_http())
-        .with_state(pool)
+        .with_state(AppState {
+            pool,
+            logins: Arc::new(LoginGuard::new(limits)),
+        })
 }

@@ -3,12 +3,14 @@
 //!
 //! Needs `TEST_DATABASE_URL` (or `.env`); without it the tests pass after a skip notice.
 
+use std::net::SocketAddr;
 use std::sync::Mutex;
 
 use hostly_core::Error;
 use hostly_core::hosts::HostStore;
 use hostly_core::sync::{ApiClient, Login, SyncFile, SyncReport, sync_once};
 use hostly_protocol::{AuthMethod, Credentials, Host, Session, error_code};
+use hostly_server::LoginLimits;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -44,9 +46,13 @@ async fn start_server() -> Option<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {
-        axum::serve(listener, hostly_server::app(pool))
-            .await
-            .unwrap()
+        let app = hostly_server::app(pool, LoginLimits::default());
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap()
     });
     Some(base)
 }

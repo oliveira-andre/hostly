@@ -4,10 +4,15 @@
 //! pass after printing a skip notice. Every test signs up its own accounts, so
 //! tests can share one database and run in parallel.
 
+use std::cell::Cell;
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use hostly_protocol::{
     API_PREFIX, Account, ApiError, AuthMethod, Changes, Credentials, Host, HostChange, PushRequest,
     PushResponse, Session, error_code,
 };
+use hostly_server::LoginLimits;
 use reqwest::StatusCode;
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
@@ -24,7 +29,10 @@ struct TestApi {
 /// Serves the app on a random port, or returns from the test when no database is configured.
 macro_rules! api {
     () => {
-        match TestApi::start().await {
+        api!(LoginLimits::default())
+    };
+    ($limits:expr) => {
+        match TestApi::start($limits).await {
             Some(api) => api,
             None => return,
         }
@@ -32,7 +40,7 @@ macro_rules! api {
 }
 
 impl TestApi {
-    async fn start() -> Option<Self> {
+    async fn start(limits: LoginLimits) -> Option<Self> {
         let _ = dotenvy::dotenv();
         let Some(url) = std::env::var("TEST_DATABASE_URL")
             .ok()
@@ -50,9 +58,13 @@ impl TestApi {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
-            axum::serve(listener, hostly_server::app(pool))
-                .await
-                .unwrap()
+            let app = hostly_server::app(pool, limits);
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap()
         });
         Some(Self {
             base,
@@ -110,6 +122,16 @@ impl TestApi {
         self.sign_up(&unique_email()).await
     }
 
+    /// Logs in as if through a reverse proxy, from `client`.
+    async fn log_in_from(&self, client: &str, email: &str, password: &str) -> reqwest::Response {
+        self.request(reqwest::Method::POST, "/sessions", None)
+            .header("x-forwarded-for", client)
+            .json(&credentials(email, password))
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn push(&self, token: &str, changes: Vec<HostChange>) -> PushResponse {
         let response = self
             .post("/hosts", Some(token), &PushRequest { changes })
@@ -133,6 +155,14 @@ async fn expect_error(response: reqwest::Response, status: StatusCode, code: &st
     let error: ApiError = response.json().await.unwrap();
     assert_eq!(error.error, code);
     error.message
+}
+
+fn retry_after(response: &reqwest::Response) -> u64 {
+    response.headers()["retry-after"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 fn unique_email() -> String {
@@ -250,6 +280,104 @@ async fn wrong_password_or_unknown_email_is_invalid_credentials() {
         )
         .await;
     }
+}
+
+#[tokio::test]
+async fn failed_log_ins_are_limited_per_client_address() {
+    let api = api!(LoginLimits {
+        address_failures: 3,
+        account_failures: 100,
+        ..LoginLimits::default()
+    });
+    let email = api.new_account().await.account.email;
+
+    // Successful log-ins don't count.
+    for _ in 0..4 {
+        let response = api.log_in_from("203.0.113.1", &email, PASSWORD).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for _ in 0..3 {
+        let response = api
+            .log_in_from("203.0.113.1", &unique_email(), PASSWORD)
+            .await;
+        expect_error(
+            response,
+            StatusCode::UNAUTHORIZED,
+            error_code::INVALID_CREDENTIALS,
+        )
+        .await;
+    }
+
+    // Now that address is refused, even with the right password...
+    let response = api.log_in_from("203.0.113.1", &email, PASSWORD).await;
+    let wait = retry_after(&response);
+    assert!((14 * 60..=15 * 60).contains(&wait), "Retry-After {wait}");
+    let message = expect_error(
+        response,
+        StatusCode::TOO_MANY_REQUESTS,
+        error_code::TOO_MANY_ATTEMPTS,
+    )
+    .await;
+    assert!(message.contains("15 minutes"), "{message}");
+
+    // ...while other addresses can still log in.
+    let response = api.log_in_from("203.0.113.2", &email, PASSWORD).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn failed_log_ins_in_a_row_lock_the_account_for_longer_each_time() {
+    let api = api!(LoginLimits {
+        account_failures: 3,
+        account_lock: Duration::from_secs(1),
+        ..LoginLimits::default()
+    });
+    let email = api.new_account().await.account.email;
+    let bystander = api.new_account().await.account.email;
+    // Each attempt comes from a new address, so only the account limit applies.
+    let attempts = Cell::new(0);
+    let log_in = async |password: &str| {
+        attempts.set(attempts.get() + 1);
+        let address = format!("198.51.100.{}", attempts.get());
+        api.log_in_from(&address, &email, password).await
+    };
+
+    // A successful log-in resets the count.
+    for _ in 0..2 {
+        assert_eq!(log_in("wrong").await.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(log_in(PASSWORD).await.status(), StatusCode::OK);
+
+    let expect_lock_after_failures = async |lock_seconds: u64| {
+        for _ in 0..3 {
+            let response = log_in("wrong").await;
+            expect_error(
+                response,
+                StatusCode::UNAUTHORIZED,
+                error_code::INVALID_CREDENTIALS,
+            )
+            .await;
+        }
+        let response = log_in(PASSWORD).await;
+        assert_eq!(retry_after(&response), lock_seconds);
+        expect_error(response, StatusCode::LOCKED, error_code::ACCOUNT_LOCKED).await;
+        tokio::time::sleep(Duration::from_secs(lock_seconds) + Duration::from_millis(200)).await;
+    };
+    expect_lock_after_failures(1).await;
+    // Failing again right after a lock locks it twice as long.
+    expect_lock_after_failures(2).await;
+
+    let response = api
+        .log_in_from("198.51.100.250", &bystander, PASSWORD)
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "other accounts are unaffected"
+    );
+    assert_eq!(log_in(PASSWORD).await.status(), StatusCode::OK);
+    // After a successful log-in, the next lock is back to the first length.
+    expect_lock_after_failures(1).await;
 }
 
 #[tokio::test]

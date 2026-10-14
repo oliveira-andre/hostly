@@ -218,6 +218,26 @@ You can also build the image on its own:
 Migrations are embedded in the binary and run on startup. The API is documented in
 `crates/hostly-protocol/src/lib.rs`.
 
+### Log-in limits
+
+To slow down password guessing, the server refuses log-ins for a while after too many failures:
+
+- **Per address:** after 10 failed log-ins from one address within 15 minutes, that address can't
+  log in until the 15 minutes are up. An IPv6 /64 counts as one address, and successful log-ins
+  don't count. These counts live in memory, so a restart clears them.
+- **Per account:** 5 failed log-ins in a row, from any addresses, lock the account for 15 minutes.
+  While it's locked, even the right password is refused. If the failures go on after the lock
+  ends, every 5 more lock it twice as long as before, up to 24 hours. A successful log-in resets
+  the count.
+
+The app shows how long to wait. For other clients, both answers carry a `Retry-After` header.
+
+Behind a reverse proxy, every connection comes from the proxy, so the server takes the client's
+address from `X-Forwarded-For`. It trusts that header only on connections from loopback or private
+addresses. Caddy (the `https` profile) and nginx with `$proxy_add_x_forwarded_for` both set it
+correctly. A client on your private network can therefore choose the address it's counted under,
+but the per-account lock still applies to it.
+
 ## Roadmap
 
 These features were identified from Termius' shipped app. They are being reimplemented independently, without copying Termius code.
@@ -233,4 +253,4 @@ These features were identified from Termius' shipped app. They are being reimple
 - [ ] Mosh, serial
 - [x] Host sync across devices through a self-hosted server (accounts, merge without data loss)
 - [ ] End-to-end encrypted password sync
-- [ ] Login rate limiting on the sync server
+- [x] Login rate limiting on the sync server
