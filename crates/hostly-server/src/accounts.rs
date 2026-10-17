@@ -13,7 +13,10 @@ use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use hostly_protocol::{Account, Credentials, MIN_PASSWORD_LEN, Session, error_code};
+use hostly_protocol::{
+    Account, Credentials, KEY_VERSION_DERIVED, KEY_VERSION_PLAIN, MIN_PASSWORD_LEN, NewAccount,
+    PasswordChange, Session, error_code, validate_sealed,
+};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -23,26 +26,46 @@ use crate::login_limits::{ClientIp, LoginGuard, LoginLimits, wait_text};
 
 const MAX_EMAIL_LEN: usize = 254;
 
-/// `POST /accounts`
+/// `POST /accounts`. Apps with end-to-end encryption send a derived login key
+/// and the wrapped vault key; older apps send the password as typed.
 pub async fn sign_up(
     State(pool): State<PgPool>,
-    ApiJson(credentials): ApiJson<Credentials>,
+    ApiJson(request): ApiJson<NewAccount>,
 ) -> Result<(StatusCode, Json<Session>), ApiFailure> {
+    let NewAccount {
+        credentials,
+        vault_key,
+    } = request;
     let email = normalize_email(&credentials.email)?;
-    if credentials.password.chars().count() < MIN_PASSWORD_LEN {
-        return Err(ApiFailure::invalid(format!(
-            "password must be at least {MIN_PASSWORD_LEN} characters"
-        )));
-    }
+    check_password(&credentials.password)?;
+    let vault_key = match (credentials.key_version, vault_key) {
+        (KEY_VERSION_PLAIN, None) => None,
+        (KEY_VERSION_DERIVED, Some(vault_key)) => {
+            validate_sealed(&vault_key)
+                .map_err(|reason| ApiFailure::invalid(format!("vault key: {reason}")))?;
+            Some(vault_key)
+        }
+        (KEY_VERSION_DERIVED, None) => {
+            return Err(ApiFailure::invalid("a derived login key needs a vault key"));
+        }
+        (KEY_VERSION_PLAIN, Some(_)) => {
+            return Err(ApiFailure::invalid("a vault key needs a derived login key"));
+        }
+        (version, _) => return Err(unknown_key_version(version)),
+    };
     let password_hash = hash_password(credentials.password).await?;
     let id = Uuid::new_v4();
-    let inserted =
-        sqlx::query("insert into accounts (id, email, password_hash) values ($1, $2, $3)")
-            .bind(id)
-            .bind(&email)
-            .bind(&password_hash)
-            .execute(&pool)
-            .await;
+    let inserted = sqlx::query(
+        "insert into accounts (id, email, password_hash, key_version, vault_key)
+         values ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(&email)
+    .bind(&password_hash)
+    .bind(i16::from(credentials.key_version))
+    .bind(&vault_key)
+    .execute(&pool)
+    .await;
     match inserted {
         Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
             return Err(ApiFailure::new(
@@ -59,11 +82,26 @@ pub async fn sign_up(
         Json(Session {
             token,
             account: Account { id, email },
+            vault_key,
         }),
     ))
 }
 
-/// `POST /sessions`, within the [`LoginLimits`].
+/// What log-in reads about an account.
+#[derive(sqlx::FromRow)]
+struct StoredAccount {
+    id: Uuid,
+    password_hash: String,
+    /// Seconds left on the account's lock, if any.
+    locked_for: Option<f64>,
+    key_version: i16,
+    vault_key: Option<String>,
+}
+
+/// `POST /sessions`, within the [`LoginLimits`]. The password must come in the
+/// form the account uses: an app with end-to-end encryption that sends a
+/// derived key for an account still on its plain password is told so
+/// ([`error_code::PLAIN_PASSWORD`]), without it counting as a failed log-in.
 pub async fn log_in(
     State(pool): State<PgPool>,
     State(guard): State<Arc<LoginGuard>>,
@@ -72,22 +110,24 @@ pub async fn log_in(
 ) -> Result<Json<Session>, ApiFailure> {
     guard.begin(client)?;
     let email = credentials.email.trim().to_lowercase();
-    // `locked_for` is the seconds left on the account's lock, if any.
-    let account: Option<(Uuid, String, Option<f64>)> = sqlx::query_as(
-        "select id, password_hash, extract(epoch from locked_until - now())::float8
+    let account: Option<StoredAccount> = sqlx::query_as(
+        "select id, password_hash,
+             extract(epoch from locked_until - now())::float8 as locked_for,
+             key_version, vault_key
          from accounts where email = $1",
     )
     .bind(&email)
     .fetch_optional(&pool)
     .await?;
-    let invalid = || {
-        ApiFailure::new(
-            StatusCode::UNAUTHORIZED,
-            error_code::INVALID_CREDENTIALS,
-            "wrong email or password",
-        )
-    };
-    let Some((id, password_hash, locked_for)) = account else {
+    let invalid = || invalid_credentials(credentials.key_version);
+    let Some(StoredAccount {
+        id,
+        password_hash,
+        locked_for,
+        key_version,
+        vault_key,
+    }) = account
+    else {
         return Err(invalid());
     };
     if let Some(seconds) = locked_for.filter(|&seconds| seconds > 0.0) {
@@ -102,7 +142,18 @@ pub async fn log_in(
         )
         .retry_after(wait));
     }
-    if !verify_password(credentials.password, password_hash).await? {
+    if key_version == i16::from(KEY_VERSION_PLAIN) && credentials.key_version == KEY_VERSION_DERIVED
+    {
+        guard.succeeded(client);
+        return Err(ApiFailure::new(
+            StatusCode::CONFLICT,
+            error_code::PLAIN_PASSWORD,
+            "this account still uses its plain password; log in with it once to upgrade",
+        ));
+    }
+    let matches = key_version == i16::from(credentials.key_version)
+        && verify_password(credentials.password, password_hash).await?;
+    if !matches {
         record_failure(&pool, id, &guard.limits).await?;
         return Err(invalid());
     }
@@ -118,6 +169,7 @@ pub async fn log_in(
     Ok(Json(Session {
         token,
         account: Account { id, email },
+        vault_key,
     }))
 }
 
@@ -146,6 +198,49 @@ pub async fn account(
         id: auth.account_id,
         email,
     }))
+}
+
+/// `PUT /account/password`: needs the current password, in the form the
+/// account uses now. Sets a derived login key and the re-wrapped vault key,
+/// which also upgrades an account from its plain password. Sessions stay
+/// valid. A wrong current password counts towards the account's lock.
+pub async fn change_password(
+    State(pool): State<PgPool>,
+    State(guard): State<Arc<LoginGuard>>,
+    auth: Authenticated,
+    ApiJson(change): ApiJson<PasswordChange>,
+) -> Result<StatusCode, ApiFailure> {
+    check_password(&change.new_password)?;
+    validate_sealed(&change.vault_key)
+        .map_err(|reason| ApiFailure::invalid(format!("vault key: {reason}")))?;
+    let (password_hash, key_version): (String, i16) =
+        sqlx::query_as("select password_hash, key_version from accounts where id = $1")
+            .bind(auth.account_id)
+            .fetch_one(&pool)
+            .await?;
+    let matches = key_version == i16::from(change.current_key_version)
+        && verify_password(change.current_password, password_hash).await?;
+    if !matches {
+        record_failure(&pool, auth.account_id, &guard.limits).await?;
+        return Err(ApiFailure::new(
+            StatusCode::UNAUTHORIZED,
+            error_code::INVALID_CREDENTIALS,
+            "the current password is wrong",
+        ));
+    }
+    let password_hash = hash_password(change.new_password).await?;
+    sqlx::query(
+        "update accounts set password_hash = $2, key_version = $3, vault_key = $4,
+             failed_logins = 0, locked_until = null
+         where id = $1",
+    )
+    .bind(auth.account_id)
+    .bind(&password_hash)
+    .bind(i16::from(KEY_VERSION_DERIVED))
+    .bind(&change.vault_key)
+    .execute(&pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The account behind the request's `Authorization: Bearer <token>` header.
@@ -184,6 +279,35 @@ where
             token_hash,
         })
     }
+}
+
+fn check_password(password: &str) -> Result<(), ApiFailure> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(ApiFailure::invalid(format!(
+            "password must be at least {MIN_PASSWORD_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn unknown_key_version(version: u8) -> ApiFailure {
+    ApiFailure::invalid(format!("unknown key version {version}"))
+}
+
+/// The same answer whether the email is unknown or the password wrong. An app
+/// from before end-to-end encryption also gets it for an upgraded account,
+/// with a hint to update.
+fn invalid_credentials(key_version: u8) -> ApiFailure {
+    let message = if key_version == KEY_VERSION_PLAIN {
+        "wrong email or password. If this account was upgraded to end-to-end encryption, update Hostly on this device"
+    } else {
+        "wrong email or password"
+    };
+    ApiFailure::new(
+        StatusCode::UNAUTHORIZED,
+        error_code::INVALID_CREDENTIALS,
+        message,
+    )
 }
 
 fn normalize_email(email: &str) -> Result<String, ApiFailure> {

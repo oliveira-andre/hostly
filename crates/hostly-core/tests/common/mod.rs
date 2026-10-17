@@ -1,12 +1,14 @@
-//! An in-process SSH server for end-to-end tests: an echo shell plus an SFTP
-//! subsystem serving the real filesystem.
+//! An in-process SSH server for end-to-end tests: an echo shell, an SFTP
+//! subsystem serving the real filesystem, TCP port forwarding both ways, and
+//! a stand-in for `mosh-server`.
 #![allow(dead_code)] // Each test binary uses a different part of this module.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hostly_core::known_hosts::KnownHosts;
@@ -14,14 +16,18 @@ use hostly_core::sftp::SftpClient;
 use hostly_core::ssh::{self, ConnectRequest, Credentials};
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session};
-use russh::{Channel, ChannelId, Pty};
+use russh::{Channel, ChannelId, ChannelOpenFailure, Disconnect, Pty};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 pub const USER: &str = "tester";
 pub const PASSWORD: &str = "s3cret";
+/// What `mosh-server` prints on the test server.
+pub const MOSH_PORT: u16 = 60001;
+pub const MOSH_KEY: &str = "AbCdEfGhIjKlMnOpQrStUv";
 
 pub struct TestServer {
     pub port: u16,
@@ -29,6 +35,10 @@ pub struct TestServer {
     pub known_hosts: KnownHosts,
     /// What the SFTP subsystem reports as the login directory (canonicalized).
     pub sftp_root: PathBuf,
+    /// Every authenticated client, so tests can drop them.
+    clients: Arc<Mutex<Vec<server::Handle>>>,
+    /// Cleared, `mosh-server` fails as a shell does when it isn't installed.
+    pub mosh_installed: Arc<AtomicBool>,
     _dirs: (tempfile::TempDir, tempfile::TempDir),
 }
 
@@ -46,8 +56,12 @@ pub async fn start_server() -> TestServer {
 
     let root_dir = tempfile::tempdir().unwrap();
     let sftp_root = fs::canonicalize(root_dir.path()).unwrap();
+    let clients = Arc::new(Mutex::new(Vec::new()));
+    let mosh_installed = Arc::new(AtomicBool::new(true));
     let mut factory = TestSsh {
         sftp_root: sftp_root.clone(),
+        clients: clients.clone(),
+        mosh_installed: mosh_installed.clone(),
     };
     tokio::spawn(async move { factory.run_on_socket(config, &listener).await });
 
@@ -61,6 +75,8 @@ pub async fn start_server() -> TestServer {
         host_key,
         known_hosts,
         sftp_root,
+        clients,
+        mosh_installed,
         _dirs: (root_dir, client_dir),
     }
 }
@@ -91,10 +107,22 @@ impl TestServer {
             .await
             .unwrap()
     }
+
+    /// Disconnects every client with `reason`, as a server shutting down would.
+    pub async fn disconnect_clients(&self, reason: &str) {
+        let clients = std::mem::take(&mut *self.clients.lock().unwrap());
+        for client in clients {
+            let _ = client
+                .disconnect(Disconnect::ByApplication, reason.into(), "en".into())
+                .await;
+        }
+    }
 }
 
 struct TestSsh {
     sftp_root: PathBuf,
+    clients: Arc<Mutex<Vec<server::Handle>>>,
+    mosh_installed: Arc<AtomicBool>,
 }
 
 impl server::Server for TestSsh {
@@ -102,20 +130,45 @@ impl server::Server for TestSsh {
     fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> TestConnection {
         TestConnection {
             sftp_root: self.sftp_root.clone(),
+            mosh_installed: self.mosh_installed.clone(),
             channels: HashMap::new(),
+            session_channels: HashSet::new(),
             sftp_channels: HashSet::new(),
+            remote_forwards: HashMap::new(),
+            clients: self.clients.clone(),
         }
     }
 }
 
 /// Echoes shell input, reports PTY and resize requests as output, exits with
-/// status 7 on `exit\r`, and serves SFTP from the real filesystem.
+/// status 7 on `exit\r`, and serves SFTP from the real filesystem. Connects
+/// `direct-tcpip` channels to their destination, listens for `tcpip-forward`,
+/// and answers `mosh-server` commands.
 struct TestConnection {
     sftp_root: PathBuf,
+    mosh_installed: Arc<AtomicBool>,
     // Held until the client picks a shell (dropped) or SFTP (turned into a stream).
     channels: HashMap<ChannelId, Channel<Msg>>,
+    // `data()` echoes only these: russh passes it tunnel data too.
+    session_channels: HashSet<ChannelId>,
     // russh also passes their data to `data()`, which must not echo it.
     sftp_channels: HashSet<ChannelId>,
+    // Listening for the client's `tcpip-forward` requests, by address and port.
+    remote_forwards: HashMap<(String, u32), AbortOnDrop>,
+    clients: Arc<Mutex<Vec<server::Handle>>>,
+}
+
+/// Stops a task when the connection that started it goes away.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn pump(mut socket: TcpStream, channel: Channel<Msg>) {
+    let _ = tokio::io::copy_bidirectional(&mut socket, &mut channel.into_stream()).await;
 }
 
 impl server::Handler for TestConnection {
@@ -129,12 +182,88 @@ impl server::Handler for TestConnection {
         })
     }
 
+    async fn auth_succeeded(&mut self, session: &mut Session) -> Result<(), Self::Error> {
+        self.clients.lock().unwrap().push(session.handle());
+        Ok(())
+    }
+
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        let destination = (host_to_connect.to_owned(), port_to_connect as u16);
+        tokio::spawn(async move {
+            match TcpStream::connect(destination).await {
+                Ok(socket) => {
+                    reply.accept().await;
+                    pump(socket, channel).await;
+                }
+                Err(_) => reply.reject(ChannelOpenFailure::ConnectFailed).await,
+            }
+        });
+        Ok(())
+    }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        let Ok(listener) = TcpListener::bind((address, *port as u16)).await else {
+            return Ok(false);
+        };
+        *port = listener.local_addr().unwrap().port().into();
+        let (handle, connected_address, connected_port) =
+            (session.handle(), address.to_owned(), *port);
+        let accepting = tokio::spawn(async move {
+            while let Ok((socket, peer)) = listener.accept().await {
+                let (handle, connected_address) = (handle.clone(), connected_address.clone());
+                tokio::spawn(async move {
+                    let opened = handle
+                        .channel_open_forwarded_tcpip(
+                            connected_address,
+                            connected_port,
+                            peer.ip().to_string(),
+                            peer.port().into(),
+                        )
+                        .await;
+                    if let Ok(channel) = opened {
+                        pump(socket, channel).await;
+                    }
+                });
+            }
+        });
+        self.remote_forwards
+            .insert((address.to_owned(), *port), AbortOnDrop(accepting));
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        Ok(self
+            .remote_forwards
+            .remove(&(address.to_owned(), port))
+            .is_some())
+    }
+
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.session_channels.insert(channel.id());
         self.channels.insert(channel.id(), channel);
         reply.accept().await;
         Ok(())
@@ -161,6 +290,32 @@ impl server::Handler for TestConnection {
     ) -> Result<(), Self::Error> {
         self.channels.remove(&channel);
         session.data(channel, b"welcome\r\n".to_vec())
+    }
+
+    /// `mosh-server …` prints a `MOSH CONNECT` line and exits, as the real one
+    /// does once it has detached. No other command exists.
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        command: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
+        session.channel_success(channel)?;
+        let installed = self.mosh_installed.load(Ordering::Relaxed);
+        let status = if command.starts_with(b"mosh-server") && installed {
+            let line = format!("\r\nMOSH CONNECT {MOSH_PORT} {MOSH_KEY}\r\n");
+            session.data(channel, line.into_bytes())?;
+            0
+        } else {
+            let name = String::from_utf8_lossy(command.split(|&b| b == b' ').next().unwrap());
+            let error = format!("bash: line 1: {name}: command not found\n");
+            session.extended_data(channel, 1, error.into_bytes())?;
+            127
+        };
+        session.exit_status_request(channel, status)?;
+        session.eof(channel)?;
+        session.close(channel)
     }
 
     async fn subsystem_request(
@@ -198,7 +353,7 @@ impl server::Handler for TestConnection {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if self.sftp_channels.contains(&channel) {
+        if self.sftp_channels.contains(&channel) || !self.session_channels.contains(&channel) {
             Ok(())
         } else if data == b"exit\r" {
             session.exit_status_request(channel, 7)?;

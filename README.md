@@ -3,7 +3,9 @@
 <img src="assets/logo.svg" width="96" alt="Hostly logo: a terminal prompt in a cloud">
 
 A desktop SSH client in Rust, in the spirit of Termius: saved hosts, tabbed
-terminals, and secrets kept in the OS keychain.
+terminals with splits, SFTP, port forwarding, snippets, local and serial
+terminals, Mosh, and secrets kept in the OS keychain, synced end-to-end
+encrypted through your own server.
 
 ## How to run
 
@@ -121,6 +123,10 @@ installers: `.dmg` for macOS, `.msi`/`.exe` for Windows, and `.deb`/`.rpm`/`.App
 | SSH agent | `SSH_AUTH_SOCK` | OpenSSH agent pipe, then Pageant | `SSH_AUTH_SOCK` |
 | Copy / paste in terminal | ⌘C / ⌘V | Ctrl+Shift+C / Ctrl+Shift+V | Ctrl+Shift+C / Ctrl+Shift+V |
 | Split right / down | ⌘G / ⇧⌘G | Ctrl+Shift+G / Ctrl+Shift+H | Ctrl+Shift+G / Ctrl+Shift+H |
+| Find in terminal / new local terminal | ⌘F / ⌘T | Ctrl+Shift+F / Ctrl+Shift+T | Ctrl+Shift+F / Ctrl+Shift+T |
+| Local terminal shell | your login `$SHELL` | `pwsh`, else Windows PowerShell | your login `$SHELL` |
+| Mosh | `brew install mosh` | not available | `apt install mosh` |
+| Serial ports | `/dev/cu.*` | `COM*` | `/dev/ttyUSB*`, `/dev/ttyACM*`; your user needs the `dialout` group |
 
 On Linux without a Secret Service, Hostly still connects; it just asks for passwords every time
 instead of saving them. The SFTP end-to-end tests run on Unix only. Their test server serves real
@@ -131,40 +137,61 @@ platform.
 
 | Path | What lives there |
 |---|---|
-| `crates/hostly-core` | UI-independent Rust: hosts file, keychain secrets, known_hosts trust, SSH sessions (russh) |
+| `crates/hostly-core` | UI-independent Rust: saved hosts, snippets and port-forwarding rules, keychain secrets, known_hosts trust, SSH sessions (russh), SFTP, port forwarding, local PTYs, serial ports, Mosh, sync and its encryption |
+| `crates/hostly-protocol` | The synced models and the sync server's JSON API, shared by the app and the server |
+| `crates/hostly-server` | The optional self-hosted sync server (axum and PostgreSQL) |
 | `src-tauri` | Thin Tauri shell exposing the core as commands; streams terminal bytes over IPC channels |
-| `src` | TypeScript UI: host sidebar, host editor, xterm.js tabs |
+| `src` | TypeScript UI: sidebar (hosts, snippets, port forwarding), editors, xterm.js tabs, SFTP, account and settings pages |
 
 App data is stored in the per-user app data directory
 (`~/Library/Application Support/app.hostly.desktop` on macOS):
 
-- `hosts.json` holds host metadata only. It contains no secrets.
+- `hosts.json`, `snippets.json` and `forwards.json` hold hosts, snippets and port-forwarding rules. They contain no secrets.
 - `known_hosts` holds host keys you approved in Hostly. `~/.ssh/known_hosts` is also honoured, but Hostly never writes to it.
-- Passwords and key passphrases are stored in the system keychain under the service `app.hostly.desktop`.
+- `sync.json` holds the login, the sync position and changes waiting to sync; `settings.json` the sync server.
+- Passwords and key passphrases are stored in the system keychain under the service `app.hostly.desktop`, readable as typed so the host editor can show them. So are the sync session token and the account's vault key while you're logged in.
 
 ## Behaviour
 
 - **Connections:** clicking a host opens a new connection every time, even when one to that host is already open.
+- **Sidebar:** switch between **Hosts**, **Snippets** and **Forwarding** at the top. The **+** button and the search box act on the section you're in.
 - **Tabs and splits:** drag tabs to reorder them, and scroll the mouse wheel over the tab bar to scroll it sideways. Split the active pane right (⌘G) or down (⇧⌘G); the new pane connects to the same host. To put **different hosts side by side**, drag a host from the sidebar onto a pane: the nearest edge decides where it opens (left/right side by side, top/bottom stacked), and dropping on the tab bar opens it in a new tab. **Drag an open tab onto a pane** the same way to join it into that split; its session moves over without reconnecting. Drag a pane's title bar to move it elsewhere in the split, or onto the tab bar to give it its own tab again. Escape cancels a drag. Or ⌥-click a host to open it beside the current pane (⇧⌥-click opens it below). Drag the dividers to resize panes. Switch tabs with ⇧⌘] and ⇧⌘[. Off macOS the shortcuts are Ctrl+Shift+G, Ctrl+Shift+H and Ctrl+PageDown/PageUp.
 - **SFTP:** Local files are shown on the left and the host's files on the right. Double-click a folder to open it. Transfer files by dragging them between the panes, with the Upload/Download buttons, or by dropping files from Finder onto the remote pane. Folders transfer recursively; existing files are overwritten. You can create folders and rename files on both sides. Delete is only available for remote files.
 - **Host keys:** the first connection shows the key's SHA-256 fingerprint for approval. If a host's key later changes, Hostly refuses to connect.
 - **Authentication:** password, private key file (with or without a passphrase), or SSH agent (`SSH_AUTH_SOCK`). If a password or passphrase is missing, Hostly asks for it and uses it for that connection only. The host editor loads the saved secret masked; the eye button reveals it so you can select and copy it.
 - **Ended sessions:** logging out (`exit` or Ctrl+D) closes the pane, and the tab once its last pane closes. If the connection drops, the pane stays open with the error; press Enter to reconnect.
+- **Find in terminal:** ⌘F (Ctrl+Shift+F off macOS) opens a panel on the right that searches the active terminal, scrollback included. Enter steps to older matches, Shift+Enter to newer ones, and clicking a listed line jumps to it. It can match case and use regular expressions. Escape closes it.
+- **Snippets:** saved commands. Click one to type it into the active terminal and press Enter; the paste button types it without running it. Multi-line scripts are pasted as one block, so shells with bracketed paste run them together.
+- **Port forwarding:** rules that tunnel through a saved host: **local** (`ssh -L`, reach a service behind the host from this computer), **remote** (`ssh -R`, let the host reach a service on this computer) and **dynamic** (`ssh -D`, a SOCKS4/SOCKS5 proxy). Click a rule to start or stop it. Each running rule has its own SSH connection; its dot turns green while it listens, the pink badge counts open tunnels, and a red dot shows why it stopped. A tunnel whose destination refuses closes on its own, and the rule keeps running. Rules don't start by themselves when Hostly starts.
+- **Local terminals:** the **+** at the end of the tab bar, or ⌘T (Ctrl+Shift+T), opens your login shell on this computer in a tab. It splits like any terminal.
+- **Serial ports:** **+** → **Serial port…** lists the connected ports; pick one and a speed (8N1, no flow control) to open it as a terminal.
+- **Mosh:** tick **Connect with Mosh** in the host editor. Hostly logs in over SSH with the host's saved credentials, starts `mosh-server` there, and runs the `mosh-client` installed on this computer. Both machines need Mosh installed (`brew install mosh`, `apt install mosh`); Windows has no `mosh-client`.
 - **Accounts and sync** are optional; Hostly works fully without logging in.
-  - **The account page:** the profile icon at the top right opens `#/account`. Logged out, it offers log in or create account against your own [sync server](#sync-server). Logged in, it shows the account, its sync status, **Sync now** and **Log out**.
-  - **The first sync after logging in removes nothing.** Hosts only on this device are uploaded and the account's hosts are downloaded. Hosts are matched by their internal id, never by name or address, so look-alike duplicates are all kept on both sides.
-  - **Afterwards, changes flow both ways.** Creating, editing or deleting a host syncs within seconds. Other devices' changes arrive every 15 seconds and whenever the window regains focus. If two devices edit the same host, the latest edit wins.
-  - **Logging out** stops syncing; the hosts stay on this device.
-  - **Passwords and key passphrases are never synced.** Each device keeps its own in the system keychain.
+  - **The account page:** the profile icon at the top right opens `#/account`. Logged out, it offers log in or create account against your own [sync server](#sync-server). Logged in, it shows the account, its sync status, password sync, **Change password**, **Sync now** and **Log out**.
+  - **What syncs:** hosts, snippets, port-forwarding rules, and saved passwords and key passphrases.
+  - **The first sync after logging in removes nothing.** Items only on this device are uploaded and the account's items are downloaded. Items are matched by their internal id, never by name or address, so look-alike duplicates are all kept on both sides. For a password both sides have, the account's wins.
+  - **Afterwards, changes flow both ways.** Creating, editing or deleting syncs within seconds. Other devices' changes arrive every 15 seconds and whenever the window regains focus. If two devices edit the same item, the latest edit wins.
+  - **Passwords sync end-to-end encrypted** with a key derived from your account password, which never leaves your devices. The server stores only ciphertext it can't decrypt. On each device they're decrypted into the system keychain, so the host editor's eye button still shows them and you can copy them.
+  - **Changing the account password** keeps every saved password readable, and your other devices stay logged in. There is no reset: if you forget the password and no device is logged in, the synced passwords can't be recovered from the server (each device keeps its own copies).
+  - **A device logged in before password sync** keeps syncing everything else; its account page asks for the password once to turn password sync on. An account created by an older Hostly is upgraded the first time this version logs in; older versions must then be updated to log in again.
+  - **Logging out** stops syncing; hosts, snippets, rules and saved passwords stay on this device.
 - **Look:** follows `DESIGN.md`, with Inter and JetBrains Mono bundled locally.
 
 ## Sync server
 
-`crates/hostly-server` is the optional API that syncs saved hosts between your devices. It holds
-accounts (email and password), login sessions, and each account's hosts in PostgreSQL. Hostly works
-fully without it. **Passwords and key passphrases are never synced.** They stay in each device's
-keychain, and the server only stores host details such as label, hostname, port, username, auth type,
-key path and group.
+`crates/hostly-server` is the optional API that syncs hosts, snippets, port-forwarding rules and
+saved passwords between your devices. It holds accounts, login sessions, and each account's items
+in PostgreSQL. Hostly works fully without it.
+
+**The server can't read your passwords.** The app derives two keys from your account password: a
+login key, which it sends instead of the password, and an encryption key, which never leaves your
+devices. Saved passwords and key passphrases reach the server only sealed with the account's vault
+key (XChaCha20-Poly1305), which the server stores only wrapped with that encryption key. Host
+details such as label, hostname, port, username, auth type, key path and group, and snippets and
+rules, are stored as sent.
+
+Older apps keep working against this server for hosts (through `/hosts`) until their account is
+upgraded by logging in with this version; after that they need updating to log in.
 
 ### Configuration
 
@@ -208,7 +235,8 @@ On the machine that will host the API, with Docker installed and this repository
 
 **Without the `https` profile**, the API is only published on `127.0.0.1:8080` of that machine.
 Use that if you already run a reverse proxy there. Keep plain HTTP off the public internet, because
-the app sends your account password when you log in. The database is never published. Its data
+anyone who sees the traffic could reuse the login key to read your synced hosts (though not your
+passwords, which stay encrypted). The database is never published. Its data
 lives in the `postgres-data` volume and survives `docker compose down` (`down -v` deletes it).
 
 You can also build the image on its own:
@@ -247,10 +275,12 @@ These features were identified from Termius' shipped app. They are being reimple
 - [x] Keychain-backed secrets, host-key verification
 - [x] SFTP browser (dual pane, recursive transfers, progress, cancel)
 - [x] Split panes, tab reordering
-- [ ] Port forwarding rules (local / remote / dynamic SOCKS)
-- [ ] Snippets
-- [ ] Local terminal tabs
-- [ ] Mosh, serial
+- [x] Port forwarding rules (local / remote / dynamic SOCKS)
+- [x] Snippets
+- [x] Local terminal tabs
+- [x] Mosh, serial
+- [x] Find in terminal (scrollback included)
 - [x] Host sync across devices through a self-hosted server (accounts, merge without data loss)
-- [ ] End-to-end encrypted password sync
+- [x] Snippet and port-forwarding rule sync
+- [x] End-to-end encrypted password sync
 - [x] Login rate limiting on the sync server

@@ -7,6 +7,7 @@ import { address, displayName, element } from "./format";
 import { icon, iconButton } from "./icons";
 import { isMac } from "./platform";
 import { type SecretField, secretField } from "./secret-input";
+import type { SidebarSection } from "./sidebar";
 import type { SplitDirection } from "./workspace/layout";
 
 const altKey = isMac ? "⌥" : "Alt";
@@ -22,18 +23,33 @@ export interface HostActions {
   cancelDrop(): void;
 }
 
-export class HostSidebar {
+export class HostSidebar implements SidebarSection {
+  readonly name = "Hosts";
+  readonly newLabel = "New host";
+  readonly placeholder = "Search hosts";
+  readonly list = document.querySelector<HTMLElement>("#host-list")!;
   private hosts: Host[] = [];
-  private filter = "";
-  private readonly list = document.querySelector<HTMLElement>("#host-list")!;
+  private filterText = "";
   private readonly editor = new HostEditor((host) => this.replace(host));
 
-  constructor(private readonly actions: HostActions) {
-    document.querySelector("#new-host")!.addEventListener("click", () => this.editor.open());
-    document.querySelector("#host-filter")!.addEventListener("input", (event) => {
-      this.filter = (event.target as HTMLInputElement).value.trim().toLowerCase();
-      this.render();
-    });
+  /** `changed` hears every change to the host list, e.g. to rename hosts elsewhere. */
+  constructor(
+    private readonly actions: HostActions,
+    private readonly changed: (hosts: readonly Host[]) => void = () => {},
+  ) {}
+
+  /** Every saved host, sorted by name. */
+  get all(): readonly Host[] {
+    return this.hosts;
+  }
+
+  create() {
+    this.editor.open();
+  }
+
+  filter(text: string) {
+    this.filterText = text.trim().toLowerCase();
+    this.render();
   }
 
   async load() {
@@ -66,13 +82,13 @@ export class HostSidebar {
   }
 
   private render() {
-    const visible = this.hosts
-      .filter((host) =>
-        [host.label, host.hostname, host.username, host.group ?? ""].some((value) =>
-          value.toLowerCase().includes(this.filter),
-        ),
-      )
-      .sort((a, b) => displayName(a).localeCompare(displayName(b)));
+    this.hosts.sort((a, b) => displayName(a).localeCompare(displayName(b)));
+    this.changed(this.hosts);
+    const visible = this.hosts.filter((host) =>
+      [host.label, host.hostname, host.username, host.group ?? ""].some((value) =>
+        value.toLowerCase().includes(this.filterText),
+      ),
+    );
 
     if (visible.length === 0) {
       const message = this.hosts.length === 0 ? "No hosts yet." : "No matching hosts.";
@@ -169,6 +185,7 @@ class HostEditor {
   constructor(private readonly onSaved: (host: Host) => void) {
     this.secretFields = [secretField(this.input("password")), secretField(this.input("passphrase"))];
     this.input("authType").addEventListener("change", () => this.showAuthFields());
+    this.input("mosh").addEventListener("change", () => this.showMoshHint());
     this.form.addEventListener("submit", (event) => {
       event.preventDefault();
       void this.save();
@@ -192,9 +209,11 @@ class HostEditor {
       this.input("group").value = host.group ?? "";
       this.input("authType").value = host.auth.type;
       this.input("keyPath").value = host.auth.type === "key" ? host.auth.path : "";
+      this.input("mosh").checked = host.mosh ?? false;
       if (host.auth.type !== "agent") void this.loadSecret(host);
     }
     this.showAuthFields();
+    this.showMoshHint();
     this.dialog.showModal();
     this.input(host ? "label" : "hostname").focus();
   }
@@ -234,6 +253,10 @@ class HostEditor {
     }
   }
 
+  private showMoshHint() {
+    this.form.querySelector<HTMLElement>("[data-mosh-hint]")!.hidden = !this.input("mosh").checked;
+  }
+
   /** undefined keeps the saved secret, "" deletes it, anything else replaces it. */
   private secretToSave(type: AuthMethod["type"]): string | undefined {
     const previous = this.editing?.auth.type;
@@ -254,6 +277,7 @@ class HostEditor {
       username: this.value("username"),
       group: this.value("group") || undefined,
       auth,
+      mosh: this.input("mosh").checked || undefined,
     };
     try {
       this.onSaved(await api.saveHost(draft, this.secretToSave(type)));

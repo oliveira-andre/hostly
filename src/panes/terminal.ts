@@ -1,16 +1,19 @@
-// A terminal pane: one xterm.js instance bound to one SSH session.
+// A terminal pane: one xterm.js instance bound to one session: an SSH (or
+// Mosh) connection to a saved host, a shell on this computer, or a serial port.
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
 import * as api from "../api";
-import type { Host, SessionStatus } from "../api";
+import type { Host, SessionCallbacks, SessionStatus } from "../api";
 import { connectWithRecovery } from "../connect";
 import { MONO_FONT, fontsReady } from "../fonts";
-import { plain } from "../format";
+import { displayName, plain } from "../format";
+import type { IconName } from "../icons";
 import { isMac } from "../platform";
 import type { Pane, PaneEvents, PaneState } from "./pane";
+import { TerminalSearch } from "./terminal-search";
 
 const ENTER = 13;
 const dim = (text: string) => `\x1b[2m${text}\x1b[0m`;
@@ -44,6 +47,22 @@ const theme = {
   brightWhite: "#F8F8F2",
 };
 
+/** What a terminal connects to. */
+export type TerminalTarget =
+  | { type: "ssh"; host: Host }
+  | { type: "local" }
+  | { type: "serial"; path: string; baudRate: number };
+
+/** Resolves to `promise`'s value, or reports its failure and resolves to null. */
+async function attempt<T>(promise: Promise<T>, report: (message: string) => void): Promise<T | null> {
+  try {
+    return await promise;
+  } catch (error) {
+    report(api.asCommandError(error).message);
+    return null;
+  }
+}
+
 export class TerminalPane implements Pane {
   readonly kind = "terminal";
   readonly element = document.createElement("div");
@@ -54,7 +73,10 @@ export class TerminalPane implements Pane {
     cursorBlink: true,
     scrollback: 10_000,
     theme,
+    // Search highlights are decorations, which xterm still marks as proposed API.
+    allowProposedApi: true,
   });
+  readonly search = new TerminalSearch(this.terminal);
   private readonly fitAddon = new FitAddon();
   private readonly resizeObserver = new ResizeObserver(() => this.fit());
   private readonly encoder = new TextEncoder();
@@ -63,7 +85,7 @@ export class TerminalPane implements Pane {
   private disposed = false;
 
   constructor(
-    readonly host: Host,
+    readonly target: TerminalTarget,
     private readonly events: PaneEvents,
   ) {
     this.element.className = "terminal-pane";
@@ -90,8 +112,47 @@ export class TerminalPane implements Pane {
     await this.connect();
   }
 
+  get host(): Host | undefined {
+    return this.target.type === "ssh" ? this.target.host : undefined;
+  }
+
+  get title(): string {
+    switch (this.target.type) {
+      case "ssh":
+        return displayName(this.target.host);
+      case "local":
+        return "Local terminal";
+      case "serial":
+        return this.target.path.split(/[\\/]/).pop() || this.target.path;
+    }
+  }
+
+  get icon(): IconName {
+    switch (this.target.type) {
+      case "ssh":
+        return "terminal";
+      case "local":
+        return "laptop";
+      case "serial":
+        return "cable";
+    }
+  }
+
   focus() {
     if (this.opened) this.terminal.focus();
+  }
+
+  /**
+   * Types a snippet into the session, as a paste so a multi-line script isn't
+   * cut short by shells with bracketed paste. `run` presses Enter after it.
+   * Returns false when there is no live session to type into.
+   */
+  typeSnippet(script: string, run: boolean): boolean {
+    if (this.state !== "connected" || !this.opened) return false;
+    this.terminal.paste(script.replace(/\s+$/, ""));
+    if (run) this.input(this.encoder.encode("\r"));
+    this.focus();
+    return true;
   }
 
   /**
@@ -125,22 +186,13 @@ export class TerminalPane implements Pane {
 
   private async connect() {
     this.setState("connecting");
-    const { username, hostname, port } = this.host;
-    this.terminal.writeln(dim(`Connecting to ${plain(`${username}@${hostname}:${port}`)}…`));
-
-    const id = await connectWithRecovery(
-      this.host,
-      (secret) =>
-        api.connect(this.host.id, { cols: this.terminal.cols, rows: this.terminal.rows }, secret, {
-          onData: (bytes) => {
-            if (!this.disposed) this.terminal.write(bytes);
-          },
-          onStatus: (status) => this.closed(status),
-        }),
-      (message) => {
-        if (!this.disposed) this.terminal.writeln(red(message));
+    this.terminal.writeln(dim(this.connectingText()));
+    const id = await this.open({
+      onData: (bytes) => {
+        if (!this.disposed) this.terminal.write(bytes);
       },
-    );
+      onStatus: (status) => this.closed(status),
+    });
     if (this.disposed) {
       if (id) void api.disconnect(id);
       return;
@@ -155,6 +207,40 @@ export class TerminalPane implements Pane {
       this.setState("connected");
       // The pane may have been resized while connecting.
       api.resize(id, this.terminal.cols, this.terminal.rows).catch(() => {});
+    }
+  }
+
+  private connectingText(): string {
+    switch (this.target.type) {
+      case "ssh": {
+        const { username, hostname, port, mosh } = this.target.host;
+        return `Connecting to ${plain(`${username}@${hostname}:${port}`)}${mosh ? " with Mosh" : ""}…`;
+      }
+      case "local":
+        return "Starting your shell…";
+      case "serial":
+        return `Opening ${plain(this.target.path)} at ${this.target.baudRate} baud…`;
+    }
+  }
+
+  /** Starts the session and resolves to its id, or to null after reporting why it failed. */
+  private open(callbacks: SessionCallbacks): Promise<string | null> {
+    const size = { cols: this.terminal.cols, rows: this.terminal.rows };
+    const report = (message: string) => {
+      if (!this.disposed) this.terminal.writeln(red(message));
+    };
+    const target = this.target;
+    switch (target.type) {
+      case "ssh":
+        return connectWithRecovery(
+          target.host,
+          (secret) => api.connect(target.host.id, size, secret, callbacks),
+          report,
+        );
+      case "local":
+        return attempt(api.openLocal(size, callbacks), report);
+      case "serial":
+        return attempt(api.openSerial(target.path, target.baudRate, callbacks), report);
     }
   }
 
@@ -194,6 +280,7 @@ export class TerminalPane implements Pane {
 
   dispose() {
     this.disposed = true;
+    this.search.dispose();
     if (this.sessionId) void api.disconnect(this.sessionId);
     this.resizeObserver.disconnect();
     this.terminal.dispose();

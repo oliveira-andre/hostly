@@ -8,8 +8,15 @@ use std::sync::Mutex;
 
 use hostly_core::Error;
 use hostly_core::hosts::HostStore;
-use hostly_core::sync::{ApiClient, Login, SyncFile, SyncReport, sync_once};
-use hostly_protocol::{AuthMethod, Credentials, Host, Session, error_code};
+use hostly_core::secrets::{MemoryStore, SecretStore, host_secret_key};
+use hostly_core::store::{ForwardStore, SnippetStore};
+use hostly_core::sync::{
+    ApiClient, ItemKey, Local, LoggedIn, Login, SyncFile, SyncReport, secrets, sync_once,
+};
+use hostly_core::vault::VaultKey;
+use hostly_protocol::{
+    AuthMethod, Credentials, Host, KEY_VERSION_PLAIN, Kind, NewAccount, Snippet, error_code,
+};
 use hostly_server::LoginLimits;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
@@ -57,36 +64,74 @@ async fn start_server() -> Option<String> {
     Some(base)
 }
 
-/// A fresh account; each test gets its own so tests can share the database.
-async fn sign_up(base: &str) -> Credentials {
-    let credentials = Credentials {
-        email: format!("sync-{}@example.com", Uuid::new_v4()),
-        password: PASSWORD.into(),
-    };
-    ApiClient::new(base, None)
-        .unwrap()
-        .sign_up(&credentials)
-        .await
-        .unwrap();
-    credentials
+fn unique_email() -> String {
+    format!("sync-{}@example.com", Uuid::new_v4())
 }
 
+/// A fresh end-to-end encrypted account, created the way the app does; each
+/// test gets its own so tests can share the database.
+async fn sign_up(base: &str) -> String {
+    let email = unique_email();
+    ApiClient::new(base, None)
+        .unwrap()
+        .create_account(&email, PASSWORD)
+        .await
+        .unwrap();
+    email
+}
+
+/// An account created by an app from before end-to-end encryption.
+async fn sign_up_plain(base: &str) -> String {
+    let email = unique_email();
+    ApiClient::new(base, None)
+        .unwrap()
+        .sign_up(&NewAccount {
+            credentials: Credentials {
+                email: email.clone(),
+                password: PASSWORD.into(),
+                key_version: KEY_VERSION_PLAIN,
+            },
+            vault_key: None,
+        })
+        .await
+        .unwrap();
+    email
+}
+
+/// One device: its stores, keychain and sync file, used the way the app does.
 struct Device {
     _dir: tempfile::TempDir,
     hosts: Mutex<HostStore>,
+    snippets: Mutex<SnippetStore>,
+    forwards: Mutex<ForwardStore>,
     sync: Mutex<SyncFile>,
+    keychain: MemoryStore,
     api: Option<ApiClient>,
+    vault: Option<VaultKey>,
 }
 
 impl Device {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name);
         Self {
-            hosts: Mutex::new(HostStore::open(dir.path().join("hosts.json")).unwrap()),
-            sync: Mutex::new(SyncFile::open(dir.path().join("sync.json")).unwrap()),
+            hosts: Mutex::new(HostStore::open(path("hosts.json")).unwrap()),
+            snippets: Mutex::new(SnippetStore::open(path("snippets.json")).unwrap()),
+            forwards: Mutex::new(ForwardStore::open(path("forwards.json")).unwrap()),
+            sync: Mutex::new(SyncFile::open(path("sync.json")).unwrap()),
+            keychain: MemoryStore::default(),
             api: None,
+            vault: None,
             _dir: dir,
         }
+    }
+
+    fn record(&self, kind: Kind, id: Uuid, deleted: bool, now: i64) {
+        self.sync
+            .lock()
+            .unwrap()
+            .record_local_change(ItemKey::new(kind, id), deleted, now)
+            .unwrap();
     }
 
     /// Saves a host the way the app does: store it, then record the change.
@@ -99,17 +144,14 @@ impl Device {
             username: "deploy".into(),
             auth: AuthMethod::Password,
             group: None,
+            mosh: false,
         };
         self.save(host, now)
     }
 
     fn save(&self, host: Host, now: i64) -> Host {
         let host = self.hosts.lock().unwrap().upsert(host).unwrap();
-        self.sync
-            .lock()
-            .unwrap()
-            .record_local_change(host.id, false, now)
-            .unwrap();
+        self.record(Kind::Host, host.id, false, now);
         host
     }
 
@@ -121,24 +163,32 @@ impl Device {
 
     fn delete(&self, id: Uuid, now: i64) {
         self.hosts.lock().unwrap().remove(id).unwrap();
-        self.sync
-            .lock()
-            .unwrap()
-            .record_local_change(id, true, now)
-            .unwrap();
+        self.record(Kind::Host, id, true, now);
+        self.keychain.delete(&host_secret_key(id)).unwrap();
+        self.record(Kind::Secret, id, true, now);
+    }
+
+    fn set_secret(&self, id: Uuid, secret: &str, now: i64) {
+        self.keychain.set(&host_secret_key(id), secret).unwrap();
+        self.record(Kind::Secret, id, false, now);
+    }
+
+    fn secret(&self, id: Uuid) -> Option<String> {
+        self.keychain.get(&host_secret_key(id)).unwrap()
     }
 
     /// Logs in through the real API, as the account page does.
-    async fn log_in(&mut self, base: &str, credentials: &Credentials) -> Session {
-        let session = ApiClient::new(base, None)
+    async fn log_in(&mut self, base: &str, email: &str, password: &str) -> LoggedIn {
+        let logged_in = ApiClient::new(base, None)
             .unwrap()
-            .log_in(credentials)
+            .open_account(email, password)
             .await
             .unwrap();
-        let login = Login::new(base.into(), session.account.clone());
+        let login = Login::new(base.into(), logged_in.session.account.clone());
         self.sync.lock().unwrap().set_login(Some(login)).unwrap();
-        self.api = Some(ApiClient::new(base, Some(session.token.clone())).unwrap());
-        session
+        self.api = Some(ApiClient::new(base, Some(logged_in.session.token.clone())).unwrap());
+        self.vault = Some(logged_in.vault.clone());
+        logged_in
     }
 
     async fn log_out(&mut self) {
@@ -146,10 +196,31 @@ impl Device {
             api.log_out().await.unwrap();
         }
         self.sync.lock().unwrap().set_login(None).unwrap();
+        self.vault = None;
     }
 
     async fn try_sync(&self, now: i64) -> hostly_core::Result<SyncReport> {
-        sync_once(&self.hosts, &self.sync, self.api.as_ref().unwrap(), now).await
+        let sealed = self.vault.as_ref().map(|vault| {
+            let ids = secrets::wanted(&self.hosts, &self.sync);
+            secrets::seal(&ids, &self.keychain, vault)
+        });
+        let local = Local {
+            hosts: &self.hosts,
+            snippets: &self.snippets,
+            forwards: &self.forwards,
+        };
+        let report = sync_once(
+            &local,
+            &self.sync,
+            self.api.as_ref().unwrap(),
+            sealed.as_ref(),
+            now,
+        )
+        .await?;
+        if let Some(vault) = &self.vault {
+            secrets::deliver(&self.sync, &self.keychain, vault)?;
+        }
+        Ok(report)
     }
 
     async fn sync(&self, now: i64) -> SyncReport {
@@ -187,19 +258,19 @@ fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
 #[tokio::test]
 async fn two_devices_merge_without_losing_anything_then_stay_in_sync() {
     let base = server!();
-    let credentials = sign_up(&base).await;
+    let email = sign_up(&base).await;
 
     let mut laptop = Device::new();
     laptop.add("storage", "10.0.0.1", 1);
     let apps = laptop.add("apps", "10.0.0.2", 2);
-    laptop.log_in(&base, &credentials).await;
+    laptop.log_in(&base, &email, PASSWORD).await;
     laptop.sync(10).await;
 
     // The desktop has its own look-alike "storage" and a host only it knows.
     let mut desktop = Device::new();
     desktop.add("storage", "10.0.0.1", 3);
     let db = desktop.add("db", "10.0.0.3", 4);
-    desktop.log_in(&base, &credentials).await;
+    desktop.log_in(&base, &email, PASSWORD).await;
     assert!(desktop.sync(20).await.hosts_changed);
     laptop.sync(21).await;
 
@@ -229,8 +300,9 @@ async fn two_devices_merge_without_losing_anything_then_stay_in_sync() {
     assert_eq!(laptop.summary(), after);
     assert_eq!(desktop.summary(), after);
     assert_eq!(desktop.get(web.id), laptop.get(web.id));
-    assert!(
-        !desktop.sync(36).await.hosts_changed,
+    assert_eq!(
+        desktop.sync(36).await,
+        SyncReport::default(),
         "nothing left to sync"
     );
 }
@@ -238,12 +310,12 @@ async fn two_devices_merge_without_losing_anything_then_stay_in_sync() {
 #[tokio::test]
 async fn the_newest_edit_wins_on_the_real_server() {
     let base = server!();
-    let credentials = sign_up(&base).await;
+    let email = sign_up(&base).await;
     let (mut laptop, mut desktop) = (Device::new(), Device::new());
     let shared = laptop.add("shared", "10.0.0.1", 1);
-    laptop.log_in(&base, &credentials).await;
+    laptop.log_in(&base, &email, PASSWORD).await;
     laptop.sync(2).await;
-    desktop.log_in(&base, &credentials).await;
+    desktop.log_in(&base, &email, PASSWORD).await;
     desktop.sync(3).await;
 
     // The newer edit reaches the server first; the older one is refused and corrected.
@@ -257,20 +329,20 @@ async fn the_newest_edit_wins_on_the_real_server() {
 #[tokio::test]
 async fn logging_out_keeps_hosts_and_logging_back_in_does_not_duplicate() {
     let base = server!();
-    let credentials = sign_up(&base).await;
+    let email = sign_up(&base).await;
     let mut laptop = Device::new();
     laptop.add("storage", "10.0.0.1", 1);
     laptop.add("apps", "10.0.0.2", 2);
 
     for round in 0..3 {
-        laptop.log_in(&base, &credentials).await;
+        laptop.log_in(&base, &email, PASSWORD).await;
         laptop.sync(10 + round).await;
         laptop.log_out().await;
         assert_eq!(laptop.summary().len(), 2, "logging out keeps the hosts");
     }
 
     let mut desktop = Device::new();
-    desktop.log_in(&base, &credentials).await;
+    desktop.log_in(&base, &email, PASSWORD).await;
     desktop.sync(20).await;
     assert_eq!(
         desktop.summary().len(),
@@ -282,13 +354,13 @@ async fn logging_out_keeps_hosts_and_logging_back_in_does_not_duplicate() {
 #[tokio::test]
 async fn a_revoked_session_is_reported_as_unauthorized() {
     let base = server!();
-    let credentials = sign_up(&base).await;
+    let email = sign_up(&base).await;
     let mut laptop = Device::new();
-    let session = laptop.log_in(&base, &credentials).await;
+    let logged_in = laptop.log_in(&base, &email, PASSWORD).await;
     laptop.sync(1).await;
 
     // Log out with the same token elsewhere, e.g. from another copy of this session.
-    ApiClient::new(&base, Some(session.token))
+    ApiClient::new(&base, Some(logged_in.session.token))
         .unwrap()
         .log_out()
         .await
@@ -310,4 +382,120 @@ async fn the_health_check_recognizes_a_hostly_server() {
 
     let unreachable = ApiClient::new("http://127.0.0.1:9", None).unwrap();
     assert!(matches!(unreachable.health().await, Err(Error::Network(_))));
+}
+
+#[tokio::test]
+async fn passwords_sync_encrypted_and_snippets_follow_along() {
+    let base = server!();
+    let email = sign_up(&base).await;
+    let (mut laptop, mut desktop) = (Device::new(), Device::new());
+    let db = laptop.add("db", "10.0.0.9", 1);
+    laptop.set_secret(db.id, "hunter2", 2);
+    let snippet = laptop
+        .snippets
+        .lock()
+        .unwrap()
+        .upsert(Snippet {
+            id: Uuid::new_v4(),
+            name: "disk".into(),
+            script: "df -h".into(),
+        })
+        .unwrap();
+    laptop.record(Kind::Snippet, snippet.id, false, 3);
+    laptop.log_in(&base, &email, PASSWORD).await;
+    laptop.sync(10).await;
+
+    desktop.log_in(&base, &email, PASSWORD).await;
+    let report = desktop.sync(11).await;
+    assert!(report.secrets_received && report.snippets_changed);
+    assert_eq!(desktop.secret(db.id).as_deref(), Some("hunter2"));
+    assert_eq!(desktop.snippets.lock().unwrap().list(), &[snippet]);
+
+    desktop.set_secret(db.id, "rotated", 20);
+    desktop.sync(21).await;
+    laptop.sync(22).await;
+    assert_eq!(laptop.secret(db.id).as_deref(), Some("rotated"));
+}
+
+#[tokio::test]
+async fn an_account_from_an_older_app_upgrades_at_its_first_log_in() {
+    let base = server!();
+    let email = sign_up_plain(&base).await;
+    let plain = || Credentials {
+        email: email.clone(),
+        password: PASSWORD.into(),
+        key_version: KEY_VERSION_PLAIN,
+    };
+    // The older app still logs in, and its hosts are in the account.
+    ApiClient::new(&base, None)
+        .unwrap()
+        .log_in(&plain())
+        .await
+        .unwrap();
+
+    let mut laptop = Device::new();
+    let db = laptop.add("db", "10.0.0.9", 1);
+    laptop.set_secret(db.id, "hunter2", 2);
+    let first = laptop.log_in(&base, &email, PASSWORD).await;
+    laptop.sync(10).await;
+
+    // From now on the plain password is refused (the older app must update),
+    // and every device unwraps the same vault key.
+    let refused = ApiClient::new(&base, None).unwrap().log_in(&plain()).await;
+    assert!(
+        matches!(&refused, Err(Error::Api { code, message, .. })
+            if code == error_code::INVALID_CREDENTIALS && message.contains("update Hostly")),
+        "{:?}",
+        refused.err()
+    );
+    let mut desktop = Device::new();
+    let second = desktop.log_in(&base, &email, PASSWORD).await;
+    assert_eq!(first.vault, second.vault);
+    desktop.sync(11).await;
+    assert_eq!(desktop.secret(db.id).as_deref(), Some("hunter2"));
+}
+
+#[tokio::test]
+async fn changing_the_password_keeps_secrets_and_other_devices_working() {
+    let base = server!();
+    let email = sign_up(&base).await;
+    let (mut laptop, mut desktop) = (Device::new(), Device::new());
+    let db = laptop.add("db", "10.0.0.9", 1);
+    laptop.set_secret(db.id, "hunter2", 2);
+    laptop.log_in(&base, &email, PASSWORD).await;
+    laptop.sync(10).await;
+    desktop.log_in(&base, &email, PASSWORD).await;
+    desktop.sync(11).await;
+
+    const NEW_PASSWORD: &str = "a much better password";
+    let api = laptop.api.as_ref().unwrap();
+    let vault = laptop.vault.clone().unwrap();
+    let wrong = api
+        .change_password(&email, "not the password", NEW_PASSWORD, &vault)
+        .await;
+    assert!(
+        matches!(&wrong, Err(Error::Api { code, .. }) if code == error_code::INVALID_CREDENTIALS)
+    );
+    api.change_password(&email, PASSWORD, NEW_PASSWORD, &vault)
+        .await
+        .unwrap();
+
+    // The desktop's session keeps syncing, the old password no longer logs
+    // in, and a new device with the new password reads the same secrets.
+    laptop.set_secret(db.id, "after the change", 20);
+    laptop.sync(21).await;
+    desktop.sync(22).await;
+    assert_eq!(desktop.secret(db.id).as_deref(), Some("after the change"));
+    let old = ApiClient::new(&base, None)
+        .unwrap()
+        .open_account(&email, PASSWORD)
+        .await;
+    assert!(
+        matches!(&old, Err(Error::Api { code, .. }) if code == error_code::INVALID_CREDENTIALS)
+    );
+    let mut tablet = Device::new();
+    let logged_in = tablet.log_in(&base, &email, NEW_PASSWORD).await;
+    assert_eq!(logged_in.vault, vault);
+    tablet.sync(23).await;
+    assert_eq!(tablet.secret(db.id).as_deref(), Some("after the change"));
 }

@@ -1,12 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::storage::{read_json, write_json};
+use crate::store::{ItemStore, Stored};
 use crate::{Error, Result};
-
-const FILE_VERSION: u32 = 1;
 
 pub use hostly_protocol::{AuthMethod, Host};
 
@@ -18,96 +15,22 @@ pub fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct HostFile {
-    version: u32,
-    hosts: Vec<Host>,
-}
+/// Saved hosts, in `hosts.json`.
+pub type HostStore = ItemStore<Host>;
 
-/// Saved hosts, persisted as JSON. Every change is written to disk before it
-/// becomes visible, so memory and disk never disagree.
-pub struct HostStore {
-    path: PathBuf,
-    hosts: Vec<Host>,
-}
+impl Stored for Host {
+    const FIELD: &'static str = "hosts";
 
-impl HostStore {
-    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        let path = path.into();
-        let hosts = read_json::<HostFile>(&path)?.map_or_else(Vec::new, |file| file.hosts);
-        Ok(Self { path, hosts })
+    fn id(&self) -> Uuid {
+        self.id
     }
 
-    pub fn list(&self) -> &[Host] {
-        &self.hosts
+    fn check(&self) -> Result<()> {
+        self.validate().map_err(Error::InvalidHost)
     }
 
-    pub fn get(&self, id: Uuid) -> Option<&Host> {
-        self.hosts.iter().find(|h| h.id == id)
-    }
-
-    /// Adds a new host or replaces the saved host with the same id.
-    pub fn upsert(&mut self, host: Host) -> Result<Host> {
-        host.validate().map_err(Error::InvalidHost)?;
-        let mut hosts = self.hosts.clone();
-        match hosts.iter_mut().find(|h| h.id == host.id) {
-            Some(existing) => *existing = host.clone(),
-            None => hosts.push(host.clone()),
-        }
-        self.commit(hosts)?;
-        Ok(host)
-    }
-
-    pub fn remove(&mut self, id: Uuid) -> Result<Host> {
-        let index = self
-            .hosts
-            .iter()
-            .position(|h| h.id == id)
-            .ok_or(Error::HostNotFound(id))?;
-        let mut hosts = self.hosts.clone();
-        let removed = hosts.remove(index);
-        self.commit(hosts)?;
-        Ok(removed)
-    }
-
-    /// Applies changes received from the sync server in a single write.
-    /// Hosts that fail validation are skipped. Returns whether anything changed.
-    pub fn apply_remote(&mut self, upserts: Vec<Host>, removals: &[Uuid]) -> Result<bool> {
-        let mut hosts = self.hosts.clone();
-        let mut changed = false;
-        for host in upserts {
-            if host.validate().is_err() {
-                continue;
-            }
-            match hosts.iter_mut().find(|h| h.id == host.id) {
-                Some(existing) if *existing == host => {}
-                Some(existing) => {
-                    *existing = host;
-                    changed = true;
-                }
-                None => {
-                    hosts.push(host);
-                    changed = true;
-                }
-            }
-        }
-        let before = hosts.len();
-        hosts.retain(|h| !removals.contains(&h.id));
-        changed |= hosts.len() != before;
-        if changed {
-            self.commit(hosts)?;
-        }
-        Ok(changed)
-    }
-
-    fn commit(&mut self, hosts: Vec<Host>) -> Result<()> {
-        let file = HostFile {
-            version: FILE_VERSION,
-            hosts,
-        };
-        write_json(&self.path, &file)?;
-        self.hosts = file.hosts;
-        Ok(())
+    fn not_found(id: Uuid) -> Error {
+        Error::HostNotFound(id)
     }
 }
 
@@ -124,6 +47,7 @@ mod tests {
             username: "deploy".into(),
             auth: AuthMethod::Agent,
             group: None,
+            mosh: false,
         }
     }
 

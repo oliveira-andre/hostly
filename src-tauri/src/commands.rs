@@ -1,7 +1,13 @@
 use hostly_core::hosts::{AuthMethod, Host, expand_home};
 use hostly_core::secrets::host_secret_key;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use hostly_core::serial::SerialPortInfo;
 use hostly_core::ssh::{self, ConnectRequest, Credentials, SessionEvent, SessionHandle};
 use hostly_core::{Error, HostKeyInfo};
+use hostly_core::{mosh, pty, serial};
+use hostly_protocol::Kind;
 use serde::Serialize;
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Manager, State};
@@ -30,6 +36,10 @@ impl From<Error> for CommandError {
 }
 
 impl CommandError {
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
+
     pub(crate) fn new(kind: &'static str, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -68,15 +78,9 @@ pub async fn save_host(
     secret: Option<String>,
 ) -> CommandResult<Host> {
     let saved = state.hosts.lock().unwrap().upsert(host)?;
-    state.sync.record(saved.id, false)?;
+    state.sync.record(Kind::Host, saved.id, false)?;
     if let Some(secret) = secret {
-        let secrets = state.secrets.clone();
-        let key = host_secret_key(saved.id);
-        blocking(move || match secret.as_str() {
-            "" => secrets.delete(&key),
-            secret => secrets.set(&key, secret),
-        })
-        .await?;
+        store_secret(&state, saved.id, (!secret.is_empty()).then_some(secret)).await?;
     }
     Ok(saved)
 }
@@ -84,9 +88,23 @@ pub async fn save_host(
 #[tauri::command]
 pub async fn delete_host(state: State<'_, AppState>, id: Uuid) -> CommandResult<()> {
     state.hosts.lock().unwrap().remove(id)?;
-    state.sync.record(id, true)?;
+    state.sync.record(Kind::Host, id, true)?;
+    store_secret(&state, id, None).await
+}
+
+/// Saves (or with `None` deletes) a host's secret in the keychain and notes
+/// the change for sync, where it travels sealed with the vault key.
+async fn store_secret(state: &AppState, id: Uuid, secret: Option<String>) -> CommandResult<()> {
+    let _writing = state.secret_writes.lock().await;
     let secrets = state.secrets.clone();
-    blocking(move || secrets.delete(&host_secret_key(id))).await
+    let key = host_secret_key(id);
+    let deleted = secret.is_none();
+    blocking(move || match secret {
+        Some(secret) => secrets.set(&key, &secret),
+        None => secrets.delete(&key),
+    })
+    .await?;
+    Ok(state.sync.record(Kind::Secret, id, deleted)?)
 }
 
 /// The saved password or key passphrase, so the owner can view and copy it.
@@ -109,8 +127,7 @@ pub async fn set_host_secret(
     if state.hosts.lock().unwrap().get(id).is_none() {
         return Err(Error::HostNotFound(id).into());
     }
-    let secrets = state.secrets.clone();
-    blocking(move || secrets.set(&host_secret_key(id), &secret)).await
+    store_secret(&state, id, Some(secret)).await
 }
 
 /// Records a host key the user approved after an `unknownHostKey` error.
@@ -183,9 +200,55 @@ pub(crate) async fn connect_request(
     })
 }
 
-/// Opens a shell on a saved host and returns its session id. Terminal output
-/// streams through `on_data` as raw bytes; `on_status` reports the close.
-/// `secret` overrides the saved password or passphrase for this attempt.
+/// Where a terminal session's events go: output to `on_data` as raw bytes,
+/// and the close to `on_status`, after which the session is forgotten.
+struct SessionSink {
+    id: Uuid,
+    /// Set by the close, which can come before the session is even tracked.
+    closed: Arc<AtomicBool>,
+}
+
+impl SessionSink {
+    fn new() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            closed: Arc::default(),
+        }
+    }
+
+    fn events(
+        &self,
+        app: AppHandle,
+        on_data: Channel,
+        on_status: Channel<SessionStatus>,
+    ) -> impl Fn(SessionEvent) + Send + Sync + 'static {
+        let (id, closed) = (self.id, self.closed.clone());
+        move |event| match event {
+            SessionEvent::Data(bytes) => {
+                let _ = on_data.send(InvokeResponseBody::Raw(bytes));
+            }
+            SessionEvent::Closed { exit_status, error } => {
+                closed.store(true, Ordering::SeqCst);
+                app.state::<AppState>().sessions.lock().unwrap().remove(&id);
+                let _ = on_status.send(SessionStatus::Closed { exit_status, error });
+            }
+        }
+    }
+
+    /// Makes the started session reachable by `write`, `resize` and
+    /// `disconnect`, unless it has already closed.
+    fn track(self, state: &AppState, handle: SessionHandle) -> Uuid {
+        let mut sessions = state.sessions.lock().unwrap();
+        if !self.closed.load(Ordering::SeqCst) {
+            sessions.insert(self.id, handle);
+        }
+        self.id
+    }
+}
+
+/// Opens a shell on a saved host, or a Mosh session if the host asks for one,
+/// and returns its session id. `secret` overrides the saved password or
+/// passphrase for this attempt.
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn connect(
@@ -198,26 +261,73 @@ pub async fn connect(
     on_data: Channel,
     on_status: Channel<SessionStatus>,
 ) -> CommandResult<Uuid> {
+    let host = state
+        .hosts
+        .lock()
+        .unwrap()
+        .get(host_id)
+        .cloned()
+        .ok_or(Error::HostNotFound(host_id))?;
+    // Checked first, so nobody is asked for a password Mosh can't use.
+    let mosh_client = match host.mosh {
+        true => Some(mosh::find_mosh_client().ok_or(Error::MoshNotInstalled)?),
+        false => None,
+    };
     let request = connect_request(&state, host_id, secret).await?;
-    let session_id = Uuid::new_v4();
-    let handle = ssh::connect(request)
-        .await?
-        .open_shell(cols, rows, move |event| match event {
-            SessionEvent::Data(bytes) => {
-                let _ = on_data.send(InvokeResponseBody::Raw(bytes));
-            }
-            SessionEvent::Closed { exit_status, error } => {
-                app.state::<AppState>()
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .remove(&session_id);
-                let _ = on_status.send(SessionStatus::Closed { exit_status, error });
-            }
-        })
-        .await?;
-    state.sessions.lock().unwrap().insert(session_id, handle);
-    Ok(session_id)
+    let sink = SessionSink::new();
+    let events = sink.events(app, on_data, on_status);
+    let connection = ssh::connect(request).await?;
+    let handle = match mosh_client {
+        Some(client) => {
+            let ip = mosh::resolve(&host.hostname, host.port).await?;
+            connection
+                .start_mosh(ip, cols, rows, &client, events)
+                .await?
+        }
+        None => connection.open_shell(cols, rows, events).await?,
+    };
+    Ok(sink.track(&state, handle))
+}
+
+/// Starts the user's login shell on this computer in a PTY.
+#[tauri::command]
+pub async fn open_local(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    cols: u32,
+    rows: u32,
+    on_data: Channel,
+    on_status: Channel<SessionStatus>,
+) -> CommandResult<Uuid> {
+    let sink = SessionSink::new();
+    let handle = pty::spawn(
+        pty::default_shell(),
+        cols,
+        rows,
+        sink.events(app, on_data, on_status),
+    )?;
+    Ok(sink.track(&state, handle))
+}
+
+#[tauri::command]
+pub async fn list_serial_ports() -> CommandResult<Vec<SerialPortInfo>> {
+    blocking(serial::list_ports).await
+}
+
+/// Opens a serial port (8N1, no flow control) as a terminal session.
+#[tauri::command]
+pub async fn open_serial(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    baud_rate: u32,
+    on_data: Channel,
+    on_status: Channel<SessionStatus>,
+) -> CommandResult<Uuid> {
+    let sink = SessionSink::new();
+    let events = sink.events(app, on_data, on_status);
+    let handle = blocking(move || serial::open(&path, baud_rate, events)).await?;
+    Ok(sink.track(&state, handle))
 }
 
 fn session(state: &AppState, id: Uuid) -> CommandResult<SessionHandle> {

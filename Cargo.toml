@@ -2,6 +2,14 @@
 resolver = "3"
 members = ["src-tauri", "crates/hostly-core", "crates/hostly-protocol", "crates/hostly-server"]
 
+# Argon2 is deliberately expensive. Unoptimized, deriving the account keys
+# takes seconds per log-in in dev builds and tests.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1

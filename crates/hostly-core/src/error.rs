@@ -13,6 +13,10 @@ pub enum Error {
     HostNotFound(Uuid),
     #[error("invalid host: {0}")]
     InvalidHost(String),
+    #[error("{kind} {id} not found")]
+    NotFound { kind: &'static str, id: Uuid },
+    #[error("invalid {kind}: {reason}")]
+    InvalidItem { kind: &'static str, reason: String },
     #[error("{}:{} presented an unknown host key ({})", .0.host, .0.port, .0.fingerprint)]
     UnknownHostKey(Box<HostKeyInfo>),
     #[error(
@@ -40,6 +44,30 @@ pub enum Error {
     SessionClosed,
     #[error("cancelled")]
     Cancelled,
+    /// A local or dynamic forward couldn't listen; `address` is `host:port`.
+    #[error("couldn't listen on {address}: {source}")]
+    ForwardBind {
+        address: String,
+        source: std::io::Error,
+    },
+    /// The server declined a remote forward's `tcpip-forward` request.
+    #[error(
+        "the server refused to listen on {address}; it may not allow port forwarding, or the port is in use"
+    )]
+    ForwardRefused { address: String },
+    #[error("couldn't start the terminal: {0}")]
+    Pty(String),
+    #[error("{0}")]
+    Serial(String),
+    #[error(
+        "mosh isn't installed on this computer; install it with `brew install mosh` or `apt install mosh`"
+    )]
+    MoshNotInstalled,
+    #[error("mosh-server isn't installed on the host, or isn't on its PATH")]
+    MoshServerMissing,
+    /// Starting `mosh-server` failed; the message includes what it printed.
+    #[error("mosh-server didn't start: {0}")]
+    Mosh(String),
     #[error("{0}")]
     Sftp(#[from] russh_sftp::client::error::Error),
     #[error("keychain: {0}")]
@@ -57,6 +85,9 @@ pub enum Error {
     },
     #[error("not logged in")]
     NotLoggedIn,
+    /// Deriving keys, or sealing and opening synced secrets, failed.
+    #[error("{0}")]
+    Vault(String),
     #[error("set your sync server in Settings first")]
     NoSyncServer,
     #[error("this address doesn't answer like a Hostly sync server")]
@@ -79,6 +110,8 @@ impl Error {
         match self {
             Error::HostNotFound(_) => "hostNotFound",
             Error::InvalidHost(_) => "invalidHost",
+            Error::NotFound { .. } => "notFound",
+            Error::InvalidItem { .. } => "invalidItem",
             Error::UnknownHostKey(_) => "unknownHostKey",
             Error::HostKeyChanged { .. } => "hostKeyChanged",
             Error::UnsupportedHostCertificate => "unsupportedHostCertificate",
@@ -89,6 +122,13 @@ impl Error {
             Error::Timeout => "timeout",
             Error::SessionClosed => "sessionClosed",
             Error::Cancelled => "cancelled",
+            Error::ForwardBind { .. } => "forwardBind",
+            Error::ForwardRefused { .. } => "forwardRefused",
+            Error::Pty(_) => "pty",
+            Error::Serial(_) => "serial",
+            Error::MoshNotInstalled => "moshNotInstalled",
+            Error::MoshServerMissing => "moshServerMissing",
+            Error::Mosh(_) => "mosh",
             Error::Sftp(_) => "sftp",
             Error::Keychain(_) => "keychain",
             Error::InvalidServerUrl => "invalidServerUrl",
@@ -97,12 +137,14 @@ impl Error {
                 error_code::INVALID => "invalid",
                 error_code::EMAIL_TAKEN => "emailTaken",
                 error_code::INVALID_CREDENTIALS => "invalidCredentials",
+                error_code::PLAIN_PASSWORD => "plainPassword",
                 error_code::UNAUTHORIZED => "unauthorized",
                 error_code::TOO_MANY_ATTEMPTS => "tooManyAttempts",
                 error_code::ACCOUNT_LOCKED => "accountLocked",
                 _ => "api",
             },
             Error::NotLoggedIn => "notLoggedIn",
+            Error::Vault(_) => "vault",
             Error::NoSyncServer => "noSyncServer",
             Error::NotASyncServer => "notASyncServer",
             Error::Ssh(_) | Error::Key(_) | Error::SshKey(_) => "ssh",

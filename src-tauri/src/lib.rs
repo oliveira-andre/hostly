@@ -1,6 +1,8 @@
 mod account;
 mod commands;
 mod files;
+mod forwarding;
+mod library;
 mod settings;
 mod state;
 
@@ -26,14 +28,28 @@ pub fn run() {
             commands::set_host_secret,
             commands::trust_host_key,
             commands::connect,
+            commands::open_local,
+            commands::list_serial_ports,
+            commands::open_serial,
             commands::write,
             commands::resize,
             commands::disconnect,
             account::account_status,
             account::sign_up,
             account::log_in,
+            account::unlock_password_sync,
+            account::change_password,
             account::log_out,
             account::sync_now,
+            library::list_snippets,
+            library::save_snippet,
+            library::delete_snippet,
+            library::list_forwards,
+            library::save_forward,
+            library::delete_forward,
+            forwarding::start_forward,
+            forwarding::stop_forward,
+            forwarding::forward_statuses,
             settings::get_settings,
             settings::set_sync_server,
             settings::check_sync_server,

@@ -19,17 +19,21 @@
             </svg>
             Hostly
           </span>
-          <button id="new-host" class="icon-button round" type="button" title="New host" aria-label="New host">
+          <button id="new-item" class="icon-button round" type="button" title="New host" aria-label="New host">
             <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
           </button>
         </header>
-        <input id="host-filter" class="search" type="search" placeholder="Search hosts" autocomplete="off" spellcheck="false" />
+        <div id="sidebar-tabs" class="segmented sidebar-tabs" role="tablist" aria-label="Sidebar"></div>
+        <input id="sidebar-filter" class="search" type="search" placeholder="Search hosts" autocomplete="off" spellcheck="false" />
         <nav id="host-list" class="host-list" aria-label="Saved hosts"></nav>
+        <nav id="snippet-list" class="host-list" aria-label="Snippets" hidden></nav>
+        <nav id="forward-list" class="host-list" aria-label="Port forwarding" hidden></nav>
       </aside>
 
       <main class="workspace">
         <div class="tab-bar">
           <div id="tabs" class="tabs" role="tablist"></div>
+          <button id="new-tab" class="icon-button new-tab" type="button" title="New tab" aria-label="New tab" aria-haspopup="menu"></button>
           <div id="tab-actions" class="tab-actions"></div>
           <button id="settings-button" class="profile-button" type="button" title="Settings" aria-label="Settings"></button>
           <button id="profile-button" class="profile-button" type="button" aria-label="Account"></button>
@@ -38,13 +42,15 @@
           <div id="empty-state" class="empty-state">
             <div class="empty-card">
               <h1>No open sessions</h1>
-              <p>Click a host to open a connection. Every click opens another one.</p>
+              <p>Click a host to open a connection; every click opens another one. Or open a terminal on this computer with the + button.</p>
               <ul id="shortcut-list" class="shortcut-list"></ul>
             </div>
           </div>
         </div>
         <section id="page" class="page" hidden></section>
       </main>
+
+      <aside id="search-panel" class="search-panel" aria-label="Find in terminal" hidden></aside>
     </div>
 
     <dialog id="host-dialog" class="dialog">
@@ -73,11 +79,81 @@
           <label>Passphrase <input name="passphrase" type="password" autocomplete="off" spellcheck="false" placeholder="Leave empty if the key has none" /></label>
         </div>
         <p data-auth="agent" class="hint">Uses the keys loaded in your SSH agent (<code>ssh-add -l</code>).</p>
-        <p class="hint">Passwords and passphrases are kept in the system keychain.</p>
+        <label class="checkbox"><input name="mosh" type="checkbox" /> Connect with Mosh</label>
+        <p class="hint" data-mosh-hint hidden>Mosh keeps the session alive across sleep and network changes. It needs <code>mosh</code> installed on this computer and on the host; Hostly logs in over SSH to start it.</p>
+        <p class="hint">Passwords and passphrases are kept in the system keychain. While you're logged in, they sync to your other devices end-to-end encrypted.</p>
         <p id="host-form-error" class="form-error" role="alert"></p>
         <menu>
           <button type="button" class="button-secondary" data-close>Cancel</button>
           <button type="submit" class="button-primary">Save</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="snippet-dialog" class="dialog">
+      <form id="snippet-form" method="dialog">
+        <h2 id="snippet-dialog-title">New snippet</h2>
+        <label>Name <input name="name" required placeholder="Disk usage" /></label>
+        <label>Script <textarea name="script" required rows="6" placeholder="df -h" autocapitalize="off" spellcheck="false"></textarea></label>
+        <p class="hint">Runs in the active terminal. Each line is entered as typed.</p>
+        <p id="snippet-form-error" class="form-error" role="alert"></p>
+        <menu>
+          <button type="button" class="button-secondary" data-close>Cancel</button>
+          <button type="submit" class="button-primary">Save</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="forward-dialog" class="dialog">
+      <form id="forward-form" method="dialog">
+        <h2 id="forward-dialog-title">New port forwarding rule</h2>
+        <label>Label <input name="label" placeholder="Production database" /></label>
+        <label>
+          Type
+          <select name="kind">
+            <option value="local">Local: reach a remote service from this computer</option>
+            <option value="remote">Remote: expose a service on this computer to the host</option>
+            <option value="dynamic">Dynamic: SOCKS proxy through the host</option>
+          </select>
+        </label>
+        <label>Host <select name="hostId" required></select></label>
+        <p class="hint" data-kind-hint></p>
+        <div class="row">
+          <label class="grow"><span data-bind-label>Listen on</span> <input name="bindAddress" required value="127.0.0.1" spellcheck="false" /></label>
+          <label class="port">Port <input name="bindPort" type="number" min="1" max="65535" required /></label>
+        </div>
+        <div class="row" data-destination>
+          <label class="grow">Destination <input name="destinationHost" placeholder="localhost" spellcheck="false" /></label>
+          <label class="port">Port <input name="destinationPort" type="number" min="1" max="65535" /></label>
+        </div>
+        <p id="forward-form-error" class="form-error" role="alert"></p>
+        <menu>
+          <button type="button" class="button-secondary" data-close>Cancel</button>
+          <button type="submit" class="button-primary">Save</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <dialog id="serial-dialog" class="dialog">
+      <form id="serial-form" method="dialog">
+        <h2>Serial connection</h2>
+        <div class="row">
+          <label class="grow">Port <select name="path" required></select></label>
+          <button type="button" class="icon-button serial-refresh" data-refresh title="Look for ports again" aria-label="Look for ports again"></button>
+        </div>
+        <label>
+          Speed
+          <select name="baudRate">
+            <option>300</option><option>1200</option><option>2400</option><option>4800</option>
+            <option>9600</option><option>19200</option><option>38400</option><option>57600</option>
+            <option selected>115200</option><option>230400</option><option>460800</option><option>921600</option>
+          </select>
+        </label>
+        <p class="hint">8 data bits, no parity, 1 stop bit, no flow control.</p>
+        <p id="serial-form-error" class="form-error" role="alert"></p>
+        <menu>
+          <button type="button" class="button-secondary" data-close>Cancel</button>
+          <button type="submit" class="button-primary">Connect</button>
         </menu>
       </form>
     </dialog>

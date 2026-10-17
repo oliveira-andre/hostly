@@ -1,16 +1,18 @@
-//! The Hostly sync server: accounts, sessions and host sync over the JSON API
-//! described in [`hostly_protocol`], stored in PostgreSQL.
+//! The Hostly sync server: accounts, sessions and sync of hosts, snippets,
+//! port forwards and end-to-end encrypted secrets over the JSON API described
+//! in [`hostly_protocol`], stored in PostgreSQL.
 
 mod accounts;
 mod error;
 mod hosts;
+mod items;
 mod login_limits;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::FromRef;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use hostly_protocol::API_PREFIX;
 use login_limits::LoginGuard;
 use sqlx::PgPool;
@@ -38,6 +40,8 @@ pub fn app(pool: PgPool, limits: LoginLimits) -> Router {
         .route("/sessions", post(accounts::log_in))
         .route("/sessions/current", delete(accounts::log_out))
         .route("/account", get(accounts::account))
+        .route("/account/password", put(accounts::change_password))
+        .route("/items", get(items::pull).post(items::push))
         .route("/hosts", get(hosts::pull).post(hosts::push));
     Router::new()
         .nest(API_PREFIX, api)

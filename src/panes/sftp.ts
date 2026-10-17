@@ -11,7 +11,9 @@ import type { Pane, PaneEvents, PaneState } from "./pane";
 
 export class SftpPane implements Pane {
   readonly kind = "sftp";
+  readonly icon = "folderOpen";
   readonly element = element("div", "sftp-pane");
+  readonly title: string;
   state: PaneState = "connecting";
   private sftpId?: string;
   private disposed = false;
@@ -24,6 +26,7 @@ export class SftpPane implements Pane {
     readonly host: Host,
     private readonly events: PaneEvents,
   ) {
+    this.title = displayName(host);
     this.local = new FileBrowser({
       side: "local",
       title: "Local",

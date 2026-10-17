@@ -1,39 +1,30 @@
-//! Host sync: devices push changes and pull everything stored after a revision.
+//! `/hosts`: the hosts in the change log, for apps from before snippets, port
+//! forwards and synced secrets. They see and change only hosts.
 
 use axum::Json;
 use axum::extract::State;
-use hostly_protocol::{Changes, Host, HostRecord, PushRequest, PushResponse};
-use serde::Deserialize;
+use hostly_protocol::{Changes, HostRecord, ItemChange, Kind, PushRequest, PushResponse};
 use sqlx::PgPool;
-use sqlx::types::Json as Jsonb;
-use uuid::Uuid;
 
 use crate::accounts::Authenticated;
 use crate::error::{ApiFailure, ApiJson, ApiQuery};
+use crate::items::{self, Row, Since};
 
-#[derive(sqlx::FromRow)]
-struct Row {
-    id: Uuid,
-    data: Option<Jsonb<Host>>,
-    modified_at: i64,
-    revision: i64,
-}
+impl TryFrom<Row> for HostRecord {
+    type Error = ApiFailure;
 
-impl From<Row> for HostRecord {
-    fn from(row: Row) -> Self {
-        Self {
+    fn try_from(row: Row) -> Result<Self, ApiFailure> {
+        Ok(Self {
             id: row.id,
-            host: row.data.map(|data| data.0),
+            host: row
+                .data
+                .map(|data| serde_json::from_value(data.0))
+                .transpose()
+                .map_err(ApiFailure::internal)?,
             modified_at: row.modified_at,
             revision: row.revision,
-        }
+        })
     }
-}
-
-#[derive(Deserialize)]
-pub struct Since {
-    #[serde(default)]
-    since: i64,
 }
 
 /// `GET /hosts?since=N`
@@ -42,29 +33,14 @@ pub async fn pull(
     auth: Authenticated,
     ApiQuery(Since { since }): ApiQuery<Since>,
 ) -> Result<Json<Changes>, ApiFailure> {
-    // One snapshot for both queries, so `revision` can't move past a change
-    // that committed between them.
-    let mut tx = pool.begin().await?;
-    sqlx::query("set transaction isolation level repeatable read, read only")
-        .execute(&mut *tx)
-        .await?;
-    let rows: Vec<Row> = sqlx::query_as(
-        "select id, data, modified_at, revision from hosts
-         where account_id = $1 and revision > $2 order by revision",
-    )
-    .bind(auth.account_id)
-    .bind(since)
-    .fetch_all(&mut *tx)
-    .await?;
-    let latest: Option<i64> =
-        sqlx::query_scalar("select max(revision) from hosts where account_id = $1")
-            .bind(auth.account_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    tx.commit().await?;
+    let (rows, revision) =
+        items::changes_since(&pool, auth.account_id, since, Some(Kind::Host)).await?;
     Ok(Json(Changes {
-        records: rows.into_iter().map(HostRecord::from).collect(),
-        revision: latest.unwrap_or(since),
+        records: rows
+            .into_iter()
+            .map(HostRecord::try_from)
+            .collect::<Result<_, _>>()?,
+        revision,
     }))
 }
 
@@ -75,61 +51,23 @@ pub async fn push(
     auth: Authenticated,
     ApiJson(request): ApiJson<PushRequest>,
 ) -> Result<Json<PushResponse>, ApiFailure> {
-    // Validate everything first, so a bad change stores nothing.
-    for change in &request.changes {
-        if let Some(host) = &change.host {
-            if host.id != change.id {
-                return Err(ApiFailure::invalid(format!(
-                    "host id {} does not match change id {}",
-                    host.id, change.id
-                )));
-            }
-            host.validate()
-                .map_err(|reason| ApiFailure::invalid(format!("host {}: {reason}", change.id)))?;
-        }
-    }
-
-    let mut tx = pool.begin().await?;
-    // Serializes this account's pushes, so its revisions commit in increasing
-    // order and a pull's `since` cursor never skips one.
-    sqlx::query("select 1 from accounts where id = $1 for update")
-        .bind(auth.account_id)
-        .execute(&mut *tx)
-        .await?;
-
-    let mut records = Vec::with_capacity(request.changes.len());
-    for change in request.changes {
-        let stored: Option<Row> = sqlx::query_as(
-            "select id, data, modified_at, revision from hosts where account_id = $1 and id = $2",
-        )
-        .bind(auth.account_id)
-        .bind(change.id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let row = match stored {
-            // The newest change wins; on a tie the incoming change does.
-            Some(row) if row.modified_at > change.modified_at => row,
-            _ => {
-                sqlx::query_as(
-                    "insert into hosts (account_id, id, data, modified_at, revision)
-                     values ($1, $2, $3, $4, nextval('host_revisions'))
-                     on conflict (account_id, id) do update set
-                         data = excluded.data,
-                         modified_at = excluded.modified_at,
-                         revision = excluded.revision,
-                         updated_at = now()
-                     returning id, data, modified_at, revision",
-                )
-                .bind(auth.account_id)
-                .bind(change.id)
-                .bind(change.host.map(Jsonb))
-                .bind(change.modified_at)
-                .fetch_one(&mut *tx)
-                .await?
-            }
-        };
-        records.push(row.into());
-    }
-    tx.commit().await?;
-    Ok(Json(PushResponse { records }))
+    let changes = request
+        .changes
+        .into_iter()
+        .map(|change| ItemChange {
+            kind: Kind::Host,
+            id: change.id,
+            data: change
+                .host
+                .map(|host| serde_json::to_value(host).expect("hosts always serialize")),
+            modified_at: change.modified_at,
+        })
+        .collect();
+    let rows = items::store(&pool, auth.account_id, changes).await?;
+    Ok(Json(PushResponse {
+        records: rows
+            .into_iter()
+            .map(HostRecord::try_from)
+            .collect::<Result<_, _>>()?,
+    }))
 }

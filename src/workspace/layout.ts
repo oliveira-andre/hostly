@@ -1,5 +1,5 @@
 // A tab's split layout: a tree of panes divided into rows and columns with draggable dividers.
-import { displayName, element } from "../format";
+import { element } from "../format";
 import { iconButton } from "../icons";
 import type { Pane } from "../panes/pane";
 
@@ -138,7 +138,7 @@ export class Layout {
     if (node.kind === "leaf") {
       const leaf = element("div", "layout-leaf");
       const header = element("div", "pane-header");
-      const title = element("span", "pane-title", displayName(node.pane.host));
+      const title = element("span", "pane-title", node.pane.title);
       const close = iconButton("close", "Close pane", () => this.events.close(node.pane), "icon-button small");
       header.append(title, close);
       header.title = "Drag to move this pane, or onto the tab bar to give it its own tab";

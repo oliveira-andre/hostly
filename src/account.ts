@@ -39,6 +39,7 @@ export class AccountView {
     server: null,
     account: null,
     sync: { state: "loggedOut", lastSyncedAt: null, message: null },
+    passwordSync: false,
   };
   /** The server logging in would use (from Settings). */
   private server: string | null = null;
@@ -50,7 +51,9 @@ export class AccountView {
     this.profile.addEventListener("click", () => toggle("account"));
     void api.onSyncStatus((sync) => {
       this.status = { ...this.status, sync };
-      if (sync.state === "loggedOut") this.status = { ...this.status, server: null, account: null };
+      if (sync.state === "loggedOut") {
+        this.status = { ...this.status, server: null, account: null, passwordSync: false };
+      }
       this.render();
     });
   }
@@ -109,7 +112,7 @@ export class AccountView {
     const note = element(
       "p",
       "hint",
-      "Hosts sync with this account across your devices. Passwords and key passphrases stay in this device's keychain and are never sent to the server.",
+      "Hosts, snippets and port forwarding rules sync with this account across your devices.",
     );
 
     const actions = element("div", "account-actions");
@@ -123,7 +126,114 @@ export class AccountView {
     logOut.addEventListener("click", () => void this.logOut());
     actions.append(syncButton, logOut);
 
-    card.append(header, status, note, actions);
+    card.append(header, status, note, this.passwordSyncSection(), this.changePasswordSection(), actions);
+  }
+
+  /** Saved passwords sync once this device holds the vault key. */
+  private passwordSyncSection(): HTMLElement {
+    const section = element("div", "password-sync");
+    if (this.status.passwordSync) {
+      const row = element("div", "password-sync-on");
+      row.append(
+        icon("shield"),
+        element(
+          "span",
+          "",
+          "Saved passwords and passphrases sync end-to-end encrypted with your account password. The server can't read them.",
+        ),
+      );
+      section.append(row);
+      return section;
+    }
+    const form = element("form", "account-form");
+    const password = passwordInput("password", "");
+    const error = element("p", "form-error");
+    error.setAttribute("role", "alert");
+    const submit = element("button", "button-primary", "Turn on password sync");
+    submit.type = "submit";
+    form.append(
+      element("h2", "", "Sync saved passwords"),
+      element(
+        "p",
+        "hint",
+        "This device logged in before passwords could sync. Enter your account password once to sync them end-to-end encrypted.",
+      ),
+      labelled("Account password", password),
+      error,
+      submit,
+    );
+    secretField(password);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      error.textContent = "";
+      submit.disabled = true;
+      try {
+        await api.unlockPasswordSync(password.value);
+        await this.refresh();
+      } catch (failure) {
+        error.textContent = api.asCommandError(failure).message;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    section.append(form);
+    return section;
+  }
+
+  private changePasswordSection(): HTMLElement {
+    const details = element("details", "change-password");
+    const summary = element("summary", "", "Change password");
+    details.append(summary);
+    if (!this.status.passwordSync) {
+      details.append(element("p", "hint", "Turn on password sync on this device first."));
+      return details;
+    }
+    const form = element("form", "account-form");
+    const current = passwordInput("current", "");
+    const next = passwordInput("new", "At least 8 characters");
+    next.minLength = 8;
+    const confirm = passwordInput("confirm", "");
+    const message = element("p", "form-error");
+    message.setAttribute("role", "alert");
+    const submit = element("button", "button-primary", "Change password");
+    submit.type = "submit";
+    form.append(
+      element(
+        "p",
+        "hint",
+        "Saved passwords stay readable on all your devices, and they stay logged in. There is no reset: if you forget the new password, synced passwords can't be recovered from the server.",
+      ),
+      labelled("Current password", current),
+      labelled("New password", next),
+      labelled("Confirm new password", confirm),
+      message,
+      submit,
+    );
+    for (const input of [current, next, confirm]) secretField(input);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      message.textContent = "";
+      message.classList.remove("ok");
+      if (next.value !== confirm.value) {
+        message.textContent = "The new passwords don't match.";
+        return;
+      }
+      submit.disabled = true;
+      try {
+        await api.changePassword(current.value, next.value);
+        form.reset();
+        message.textContent = "Password changed.";
+        message.classList.add("ok");
+      } catch (failure) {
+        const error = api.asCommandError(failure);
+        message.textContent =
+          error.kind === "invalidCredentials" ? "The current password is wrong." : error.message;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    details.append(form);
+    return details;
   }
 
   private renderNoServer(card: HTMLElement) {
@@ -147,7 +257,7 @@ export class AccountView {
     const intro = element(
       "p",
       "hint",
-      "Hostly works without an account. Log in to sync your hosts through your Hostly server. Hosts already on this device are kept.",
+      "Hostly works without an account. Log in to sync hosts, snippets, port forwarding rules and saved passwords through your Hostly server. Passwords are end-to-end encrypted with your account password, so the server can't read them. Anything already on this device is kept.",
     );
 
     const serverRow = element("div", "server-row");
@@ -195,7 +305,14 @@ export class AccountView {
     form.append(field("Email", email), field("Password", password));
     secretField(password);
     if (signingUp) {
-      form.append(field("Confirm password", confirm));
+      form.append(
+        field("Confirm password", confirm),
+        element(
+          "p",
+          "hint",
+          "This password also encrypts your saved passwords. The server can't reset it: if you forget it, synced passwords can't be recovered, though each device keeps its own copies.",
+        ),
+      );
       secretField(confirm);
     }
     form.append(error, submit);
@@ -225,7 +342,7 @@ export class AccountView {
   private async logOut() {
     const confirmed = await confirmAction({
       title: "Log out?",
-      message: "Syncing stops. Your hosts stay on this device.",
+      message: "Syncing stops. Your hosts, snippets, rules and saved passwords stay on this device.",
       confirmLabel: "Log out",
       danger: true,
     });
@@ -233,4 +350,17 @@ export class AccountView {
     await api.logOut();
     await this.refresh();
   }
+}
+
+function passwordInput(name: string, placeholder: string): HTMLInputElement {
+  const input = element("input", "");
+  Object.assign(input, { name, type: "password", placeholder, required: true, spellcheck: false });
+  input.autocomplete = "off";
+  return input;
+}
+
+function labelled(label: string, input: HTMLInputElement): HTMLElement {
+  const wrapper = element("label", "");
+  wrapper.append(label, input);
+  return wrapper;
 }

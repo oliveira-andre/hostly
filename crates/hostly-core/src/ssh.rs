@@ -8,7 +8,10 @@ use russh::keys::{self, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect, client};
 use tokio::sync::mpsc;
 
+use crate::forward::Incoming;
 use crate::known_hosts::{HostKeyStatus, KnownHosts};
+use crate::session::Command;
+pub use crate::session::{SessionEvent, SessionHandle};
 use crate::{Error, HostKeyInfo, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -31,53 +34,12 @@ pub struct ConnectRequest {
     pub known_hosts: KnownHosts,
 }
 
-/// An authenticated SSH connection, consumed by opening a shell or an SFTP client.
+/// An authenticated SSH connection, consumed by opening a shell, an SFTP client
+/// or a port forward.
 pub struct Connection {
     pub(crate) session: client::Handle<ClientHandler>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum SessionEvent {
-    /// Terminal output, stdout and stderr interleaved as the server sent them.
-    Data(Vec<u8>),
-    /// Always the last event of a session.
-    Closed {
-        exit_status: Option<u32>,
-        error: Option<String>,
-    },
-}
-
-enum Command {
-    Write(Vec<u8>),
-    Resize { cols: u32, rows: u32 },
-    Close,
-}
-
-/// Controls a running shell. Cheap to clone; the session ends on [`close`](Self::close)
-/// or when the server closes it, after which every call returns [`Error::SessionClosed`].
-#[derive(Clone)]
-pub struct SessionHandle {
-    commands: mpsc::UnboundedSender<Command>,
-}
-
-impl SessionHandle {
-    pub fn write(&self, data: Vec<u8>) -> Result<()> {
-        self.send(Command::Write(data))
-    }
-
-    pub fn resize(&self, cols: u32, rows: u32) -> Result<()> {
-        self.send(Command::Resize { cols, rows })
-    }
-
-    pub fn close(&self) {
-        let _ = self.commands.send(Command::Close);
-    }
-
-    fn send(&self, command: Command) -> Result<()> {
-        self.commands
-            .send(command)
-            .map_err(|_| Error::SessionClosed)
-    }
+    /// What the server sends outside the client's own channels; only a forward reads it.
+    pub(crate) incoming: mpsc::UnboundedReceiver<Incoming>,
 }
 
 /// Connects, verifies the host key and authenticates.
@@ -86,10 +48,12 @@ pub async fn connect(request: ConnectRequest) -> Result<Connection> {
         keepalive_interval: Some(KEEPALIVE_INTERVAL),
         ..Default::default()
     });
+    let (incoming_sender, incoming) = mpsc::unbounded_channel();
     let handler = ClientHandler {
         host: request.host.clone(),
         port: request.port,
         known_hosts: request.known_hosts,
+        incoming: incoming_sender,
     };
     let address = (request.host.as_str(), request.port);
     let mut session =
@@ -98,7 +62,7 @@ pub async fn connect(request: ConnectRequest) -> Result<Connection> {
             .map_err(|_| Error::Timeout)??;
 
     authenticate(&mut session, &request.username, request.credentials).await?;
-    Ok(Connection { session })
+    Ok(Connection { session, incoming })
 }
 
 impl Connection {
@@ -123,6 +87,7 @@ pub(crate) struct ClientHandler {
     host: String,
     port: u16,
     known_hosts: KnownHosts,
+    incoming: mpsc::UnboundedSender<Incoming>,
 }
 
 impl client::Handler for ClientHandler {
@@ -143,6 +108,32 @@ impl client::Handler for ClientHandler {
                 line,
             }),
         }
+    }
+
+    /// Hands the channel to a running remote forward. Without one, the send
+    /// fails and dropping `reply` refuses the channel.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<client::Msg>,
+        _connected_address: &str,
+        _connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<()> {
+        let _ = self.incoming.send(Incoming::Channel { channel, reply });
+        Ok(())
+    }
+
+    /// Same outcome as the default, but also tells a running forward why the connection ended.
+    async fn disconnected(&mut self, reason: client::DisconnectReason<Error>) -> Result<()> {
+        let (message, result) = match reason {
+            client::DisconnectReason::ReceivedDisconnect(info) => (info.message, Ok(())),
+            client::DisconnectReason::Error(e) => (e.to_string(), Err(e)),
+        };
+        let _ = self.incoming.send(Incoming::Disconnected(message));
+        result
     }
 }
 

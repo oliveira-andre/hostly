@@ -9,23 +9,32 @@ use hostly_core::secrets::{Keychain, SecretStore, host_secret_key};
 use hostly_core::settings::SettingsFile;
 use hostly_core::sftp::SftpClient;
 use hostly_core::ssh::SessionHandle;
-use hostly_core::sync::SyncFile;
+use hostly_core::store::{ForwardStore, SnippetStore};
+use hostly_core::sync::{Local, SyncFile};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
 use crate::account::SyncService;
+use crate::forwarding::Run;
 
 /// Data directory name and keychain service from before the app was renamed to Hostly.
 const LEGACY_IDENTIFIER: &str = "app.ferrite.desktop";
 
 pub struct AppState {
     pub hosts: Mutex<HostStore>,
+    pub snippets: Mutex<SnippetStore>,
+    pub forwards: Mutex<ForwardStore>,
     pub secrets: Arc<dyn SecretStore>,
+    /// Held across a host secret's keychain write and the sync record that
+    /// follows it, so a secret arriving from sync can't overwrite a newer one.
+    pub secret_writes: tokio::sync::Mutex<()>,
     pub known_hosts: KnownHosts,
     pub sessions: Mutex<HashMap<Uuid, SessionHandle>>,
     pub sftp: Mutex<HashMap<Uuid, Arc<SftpClient>>>,
     /// Cancel flags of running transfers.
     pub transfers: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
+    /// Port-forwarding rules that are starting, running or stopped with an error.
+    pub forwarding: Mutex<HashMap<Uuid, Run>>,
     pub home_dir: Option<PathBuf>,
     pub sync: SyncService,
     pub settings: Mutex<SettingsFile>,
@@ -44,10 +53,21 @@ impl AppState {
             secrets.as_ref(),
         )?;
         std::fs::create_dir_all(&data_dir)?;
-        let home_dir = app.path().home_dir().ok();
+        Ok(Self::open(&data_dir, secrets, app.path().home_dir().ok())?)
+    }
+
+    /// The state kept in `data_dir`, with secrets in `secrets`.
+    pub fn open(
+        data_dir: &Path,
+        secrets: Arc<dyn SecretStore>,
+        home_dir: Option<PathBuf>,
+    ) -> hostly_core::Result<Self> {
         Ok(Self {
             hosts: Mutex::new(HostStore::open(data_dir.join("hosts.json"))?),
+            snippets: Mutex::new(SnippetStore::open(data_dir.join("snippets.json"))?),
+            forwards: Mutex::new(ForwardStore::open(data_dir.join("forwards.json"))?),
             secrets,
+            secret_writes: tokio::sync::Mutex::const_new(()),
             known_hosts: KnownHosts {
                 user_file: home_dir.as_ref().map(|home| home.join(".ssh/known_hosts")),
                 app_file: data_dir.join("known_hosts"),
@@ -55,10 +75,22 @@ impl AppState {
             sessions: Mutex::default(),
             sftp: Mutex::default(),
             transfers: Mutex::default(),
+            forwarding: Mutex::default(),
             home_dir,
             sync: SyncService::new(SyncFile::open(data_dir.join("sync.json"))?),
             settings: Mutex::new(SettingsFile::open(data_dir.join("settings.json"))?),
         })
+    }
+}
+
+impl AppState {
+    /// The stores sync keeps up to date.
+    pub fn local(&self) -> Local<'_> {
+        Local {
+            hosts: &self.hosts,
+            snippets: &self.snippets,
+            forwards: &self.forwards,
+        }
     }
 }
 
@@ -110,6 +142,7 @@ mod tests {
                 username: "deploy".into(),
                 auth: AuthMethod::Password,
                 group: None,
+                mosh: false,
             })
             .unwrap();
         std::fs::write(

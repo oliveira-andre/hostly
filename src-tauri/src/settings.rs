@@ -89,33 +89,15 @@ pub async fn check_sync_server(server: String) -> CommandResult<()> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, mpsc};
     use std::time::Duration;
 
-    use hostly_core::hosts::HostStore;
-    use hostly_core::known_hosts::KnownHosts;
     use hostly_core::secrets::MemoryStore;
-    use hostly_core::settings::SettingsFile;
-    use hostly_core::sync::SyncFile;
 
     use super::*;
-    use crate::account::SyncService;
 
     fn state(dir: &Path) -> AppState {
-        AppState {
-            hosts: Mutex::new(HostStore::open(dir.join("hosts.json")).unwrap()),
-            secrets: Arc::new(MemoryStore::default()),
-            known_hosts: KnownHosts {
-                user_file: None,
-                app_file: dir.join("known_hosts"),
-            },
-            sessions: Mutex::default(),
-            sftp: Mutex::default(),
-            transfers: Mutex::default(),
-            home_dir: None,
-            sync: SyncService::new(SyncFile::open(dir.join("sync.json")).unwrap()),
-            settings: Mutex::new(SettingsFile::open(dir.join("settings.json")).unwrap()),
-        }
+        AppState::open(dir, Arc::new(MemoryStore::default()), None).unwrap()
     }
 
     /// `get_settings` runs on the main thread, so a lock it never gets back hangs the app.

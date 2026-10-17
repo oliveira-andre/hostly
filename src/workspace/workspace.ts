@@ -5,7 +5,7 @@ import { displayName, element } from "../format";
 import { icon, iconButton } from "../icons";
 import type { Pane, PaneEvents, PaneState } from "../panes/pane";
 import { SftpPane } from "../panes/sftp";
-import { TerminalPane } from "../panes/terminal";
+import { TerminalPane, type TerminalTarget } from "../panes/terminal";
 import { shortcutHint } from "../platform";
 import { Layout, type LayoutEvents, type SplitDirection, type SplitPosition } from "./layout";
 import { TabBar } from "./tab-bar";
@@ -44,14 +44,14 @@ class Tab {
     const panes = this.layout.panes();
     const pane = this.activePane;
     // "storage · apps" for a split of two hosts; "+1" counts repeats of the same host.
-    const names = [...new Set(panes.map((p) => displayName(p.host)))];
+    const names = [...new Set(panes.map((p) => p.title))];
     const repeats = panes.length - names.length;
     this.label.textContent = `${names.join(" · ")}${repeats ? ` +${repeats}` : ""}`;
     this.button.title = [
-      ...panes.map((p) => `${p.kind === "sftp" ? "SFTP · " : ""}${displayName(p.host)}`),
+      ...panes.map((p) => `${p.kind === "sftp" ? "SFTP · " : ""}${p.title}`),
       "Drag onto a pane to split with it",
     ].join("\n");
-    this.kindIcon.replaceChildren(icon(pane.kind === "sftp" ? "folderOpen" : "terminal", 14));
+    this.kindIcon.replaceChildren(icon(pane.icon, 14));
     this.status.dataset.state = summarize(panes.map((p) => p.state));
     this.body.classList.toggle("split", panes.length > 1);
   }
@@ -72,6 +72,14 @@ interface Placement {
   label: string;
   /** Absent: a new tab. */
   beside?: Beside;
+}
+
+/** What the workspace tells the rest of the window. */
+export interface WorkspaceHooks {
+  /** The pane that has focus in the visible tab changed, or no tab is left. */
+  activePaneChanged(pane: Pane | undefined): void;
+  /** The tab bar's search button. */
+  toggleSearch(): void;
 }
 
 /** Any pane connecting → connecting; any connected → connected; otherwise closed. */
@@ -96,6 +104,7 @@ export class Workspace {
     grab: (pane, handle, down) => this.grabPane(pane, handle, down),
   };
   private readonly dropIndicator = element("div", "drop-indicator");
+  private readonly sftpButton: HTMLButtonElement;
   private ghost?: DragGhost;
   private readonly paneEvents: PaneEvents = {
     stateChanged: (pane) => this.tabOf(pane)?.update(),
@@ -103,37 +112,68 @@ export class Workspace {
     closeRequested: (pane) => this.closePane(pane),
   };
 
-  constructor() {
+  constructor(private readonly hooks: WorkspaceHooks) {
     this.dropIndicator.append(element("span", "drop-label"));
     this.dropIndicator.hidden = true;
     document.body.append(this.dropIndicator);
     const actions = document.querySelector<HTMLElement>("#tab-actions")!;
+    this.sftpButton = iconButton("folderOpen", "Open SFTP for this host", () => {
+      const host = this.active?.activePane.host;
+      if (host) this.openSftp(host);
+    });
     actions.append(
       iconButton("splitRight", shortcutHint("splitRight"), () => this.split("row")),
       iconButton("splitDown", shortcutHint("splitDown"), () => this.split("column")),
-      iconButton("folderOpen", "Open SFTP for this host", () => {
-        if (this.active) this.openSftp(this.active.activePane.host);
-      }),
+      this.sftpButton,
+      iconButton("search", shortcutHint("find"), () => hooks.toggleSearch()),
     );
     this.updateActions();
   }
 
   openTerminal(host: Host) {
-    this.openTab(new TerminalPane(host, this.paneEvents));
+    this.openTab(new TerminalPane({ type: "ssh", host }, this.paneEvents));
+  }
+
+  /** A shell on this computer, in a new tab. */
+  openLocal() {
+    this.openTab(new TerminalPane({ type: "local" }, this.paneEvents));
+  }
+
+  openSerial(path: string, baudRate: number) {
+    this.openTab(new TerminalPane({ type: "serial", path, baudRate }, this.paneEvents));
+  }
+
+  /** The visible tab's focused terminal, if it is one. */
+  activeTerminal(): TerminalPane | undefined {
+    const pane = this.active?.activePane;
+    return pane instanceof TerminalPane ? pane : undefined;
   }
 
   openSftp(host: Host) {
     this.openTab(new SftpPane(host, this.paneEvents));
   }
 
-  /** Opens a new terminal to the active pane's host beside it. */
+  /**
+   * Opens a new terminal like the active pane beside it: to the same host, or
+   * another local shell. A serial port can only be open once, so splitting
+   * one opens a local shell.
+   */
   split(direction: SplitDirection) {
-    if (this.active) this.openBeside(this.active.activePane.host, direction);
+    const pane = this.active?.activePane;
+    if (!pane) return;
+    const target: TerminalTarget =
+      pane instanceof TerminalPane
+        ? pane.target.type === "serial"
+          ? { type: "local" }
+          : pane.target
+        : { type: "ssh", host: pane.host! };
+    this.splitWith(target, { pane, direction, position: "after" });
   }
 
   /** Opens `host` beside the active pane, or in a new tab when nothing is open. */
   openBeside(host: Host, direction: SplitDirection) {
-    if (this.active) this.splitWith(host, { pane: this.active.activePane, direction, position: "after" });
+    const target: TerminalTarget = { type: "ssh", host };
+    if (this.active) this.splitWith(target, { pane: this.active.activePane, direction, position: "after" });
     else this.openTerminal(host);
   }
 
@@ -183,7 +223,7 @@ export class Workspace {
     const { beside } = placement;
     switch (source.kind) {
       case "host":
-        if (beside) this.splitWith(source.host, beside);
+        if (beside) this.splitWith({ type: "ssh", host: source.host }, beside);
         else this.openTerminal(source.host);
         break;
       case "tab":
@@ -196,10 +236,10 @@ export class Workspace {
     }
   }
 
-  private splitWith(host: Host, { pane: target, direction, position }: Beside) {
+  private splitWith(terminal: TerminalTarget, { pane: target, direction, position }: Beside) {
     const tab = this.tabOf(target);
     if (!tab) return;
-    const pane = new TerminalPane(host, this.paneEvents);
+    const pane = new TerminalPane(terminal, this.paneEvents);
     tab.layout.split(target, pane, direction, position);
     this.markActive(pane);
     pane.start();
@@ -343,6 +383,8 @@ export class Workspace {
     tab.activePane = pane;
     tab.layout.setActive(pane);
     tab.update();
+    this.updateActions();
+    this.hooks.activePaneChanged(this.active?.activePane);
   }
 
   private closePane(pane: Pane) {
@@ -385,6 +427,7 @@ export class Workspace {
         this.active = undefined;
         this.emptyState.hidden = false;
         this.updateActions();
+        this.hooks.activePaneChanged(undefined);
       }
     }
   }
@@ -408,6 +451,7 @@ export class Workspace {
     for (const button of document.querySelectorAll<HTMLButtonElement>("#tab-actions button")) {
       button.disabled = !this.active;
     }
+    this.sftpButton.disabled = !this.active?.activePane.host;
   }
 }
 
@@ -416,8 +460,8 @@ function ghostFor(source: DragSource): DragGhost {
     case "host":
       return new DragGhost("server", displayName(source.host));
     case "tab":
-      return new DragGhost(source.tab.activePane.kind === "sftp" ? "folderOpen" : "terminal", source.tab.title);
+      return new DragGhost(source.tab.activePane.icon, source.tab.title);
     case "pane":
-      return new DragGhost(source.pane.kind === "sftp" ? "folderOpen" : "terminal", displayName(source.pane.host));
+      return new DragGhost(source.pane.icon, source.pane.title);
   }
 }

@@ -9,8 +9,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use hostly_protocol::{
-    API_PREFIX, Account, ApiError, AuthMethod, Changes, Credentials, Host, HostChange, PushRequest,
-    PushResponse, Session, error_code,
+    API_PREFIX, Account, ApiError, AuthMethod, Changes, Credentials, Forward, ForwardKind, Host,
+    HostChange, Item, ItemChange, ItemChanges, ItemPushRequest, ItemPushResponse,
+    KEY_VERSION_DERIVED, KEY_VERSION_PLAIN, Kind, NewAccount, PasswordChange, PushRequest,
+    PushResponse, Session, Snippet, error_code,
 };
 use hostly_server::LoginLimits;
 use reqwest::StatusCode;
@@ -140,6 +142,46 @@ impl TestApi {
         response.json().await.unwrap()
     }
 
+    async fn put(
+        &self,
+        path: &str,
+        token: Option<&str>,
+        body: &impl Serialize,
+    ) -> reqwest::Response {
+        self.request(reqwest::Method::PUT, path, token)
+            .json(body)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// Signs up the way apps with end-to-end encryption do.
+    async fn sign_up_derived(&self, email: &str, login_key: &str, vault_key: &str) -> Session {
+        let request = NewAccount {
+            credentials: derived(email, login_key),
+            vault_key: Some(vault_key.into()),
+        };
+        let response = self.post("/accounts", None, &request).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response.json().await.unwrap()
+    }
+
+    async fn push_items(&self, token: &str, changes: Vec<ItemChange>) -> ItemPushResponse {
+        let response = self
+            .post("/items", Some(token), &ItemPushRequest { changes })
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.unwrap()
+    }
+
+    async fn pull_items(&self, token: &str, since: i64) -> ItemChanges {
+        let response = self
+            .get(&format!("/items?since={since}"), Some(token))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.unwrap()
+    }
+
     async fn pull(&self, token: &str, since: i64) -> Changes {
         let response = self
             .get(&format!("/hosts?since={since}"), Some(token))
@@ -173,6 +215,29 @@ fn credentials(email: &str, password: &str) -> Credentials {
     Credentials {
         email: email.into(),
         password: password.into(),
+        key_version: KEY_VERSION_PLAIN,
+    }
+}
+
+fn derived(email: &str, login_key: &str) -> Credentials {
+    Credentials {
+        email: email.into(),
+        password: login_key.into(),
+        key_version: KEY_VERSION_DERIVED,
+    }
+}
+
+/// A well-formed sealed value; the server can't tell real ones apart.
+fn sealed(seed: char) -> String {
+    format!("v1.{}", seed.to_string().repeat(64))
+}
+
+fn item(item: Item, id: Uuid, modified_at: i64) -> ItemChange {
+    ItemChange {
+        kind: item.kind(),
+        id,
+        data: Some(item.encode()),
+        modified_at,
     }
 }
 
@@ -185,6 +250,7 @@ fn host(id: Uuid, label: &str) -> Host {
         username: "deploy".into(),
         auth: AuthMethod::Password,
         group: None,
+        mosh: false,
     }
 }
 
@@ -642,4 +708,281 @@ async fn concurrent_pushes_get_distinct_increasing_revisions() {
             .all(|w| w[0].revision < w[1].revision)
     );
     assert_eq!(changes.revision, changes.records[9].revision);
+}
+
+#[tokio::test]
+async fn items_of_every_kind_share_one_log_and_hosts_sees_only_hosts() {
+    let api = api!();
+    let token = api.new_account().await.token;
+    let a = host(Uuid::new_v4(), "a");
+    let snippet = Snippet {
+        id: Uuid::new_v4(),
+        name: "disk".into(),
+        script: "df -h".into(),
+    };
+    let forward = Forward {
+        id: Uuid::new_v4(),
+        label: "db".into(),
+        host_id: a.id,
+        kind: ForwardKind::Local,
+        bind_address: "127.0.0.1".into(),
+        bind_port: 5433,
+        destination_host: Some("localhost".into()),
+        destination_port: Some(5432),
+    };
+    // A host's secret shares the host's id.
+    let pushed = api
+        .push_items(
+            &token,
+            vec![
+                item(Item::Host(a.clone()), a.id, 1),
+                item(Item::Snippet(snippet.clone()), snippet.id, 1),
+                item(Item::Forward(forward.clone()), forward.id, 1),
+                item(Item::Secret(sealed('s')), a.id, 1),
+            ],
+        )
+        .await
+        .records;
+    let kinds: Vec<Kind> = pushed.iter().map(|r| r.kind).collect();
+    assert_eq!(
+        kinds,
+        [Kind::Host, Kind::Snippet, Kind::Forward, Kind::Secret]
+    );
+    assert!(pushed.windows(2).all(|w| w[0].revision < w[1].revision));
+
+    let all = api.pull_items(&token, 0).await;
+    assert_eq!(all.records, pushed);
+    assert_eq!(all.revision, pushed[3].revision);
+
+    // Older apps see only the hosts, and their host changes land in the log.
+    let hosts = api.pull(&token, 0).await;
+    assert_eq!(hosts.records.len(), 1);
+    assert_eq!(hosts.records[0].host.as_ref(), Some(&a));
+    assert_eq!(hosts.revision, pushed[0].revision);
+    let b = host(Uuid::new_v4(), "b");
+    let from_old_app = api.push(&token, vec![save(b.clone(), 2)]).await.records[0].clone();
+    let newer = api.pull_items(&token, all.revision).await.records;
+    assert_eq!(newer.len(), 1);
+    assert_eq!((newer[0].kind, newer[0].id), (Kind::Host, b.id));
+    assert_eq!(newer[0].revision, from_old_app.revision);
+
+    // Deleting the snippet leaves a tombstone for that kind only.
+    let deleted = api
+        .push_items(
+            &token,
+            vec![ItemChange {
+                kind: Kind::Snippet,
+                id: snippet.id,
+                data: None,
+                modified_at: 3,
+            }],
+        )
+        .await
+        .records[0]
+        .clone();
+    assert_eq!((deleted.kind, deleted.data.as_ref()), (Kind::Snippet, None));
+}
+
+#[tokio::test]
+async fn invalid_items_store_nothing() {
+    let api = api!();
+    let token = api.new_account().await.token;
+    let valid = host(Uuid::new_v4(), "valid");
+    let empty_script = Snippet {
+        id: Uuid::new_v4(),
+        name: "empty".into(),
+        script: " ".into(),
+    };
+    let cases = [
+        item(Item::Snippet(empty_script.clone()), empty_script.id, 1),
+        item(Item::Secret("hunter2".into()), valid.id, 1),
+        // Host data stored as another kind.
+        ItemChange {
+            kind: Kind::Snippet,
+            id: valid.id,
+            data: Some(Item::Host(valid.clone()).encode()),
+            modified_at: 1,
+        },
+    ];
+    for bad in cases {
+        let response = api
+            .post(
+                "/items",
+                Some(&token),
+                &ItemPushRequest {
+                    changes: vec![item(Item::Host(valid.clone()), valid.id, 1), bad],
+                },
+            )
+            .await;
+        expect_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error_code::INVALID,
+        )
+        .await;
+    }
+    assert!(api.pull_items(&token, 0).await.records.is_empty());
+}
+
+#[tokio::test]
+async fn derived_accounts_keep_their_vault_key_and_need_their_key_version() {
+    let api = api!();
+    let email = unique_email();
+    let login_key = "derived-login-key-0123456789-abcdefghijklmnop";
+    let session = api.sign_up_derived(&email, login_key, &sealed('v')).await;
+    assert_eq!(session.vault_key, Some(sealed('v')));
+
+    let response = api
+        .post("/sessions", None, &derived(&email, login_key))
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let again: Session = response.json().await.unwrap();
+    assert_eq!(again.vault_key, Some(sealed('v')));
+
+    // An older app sending a password gets the usual answer, with a hint.
+    let response = api
+        .post("/sessions", None, &credentials(&email, login_key))
+        .await;
+    let message = expect_error(
+        response,
+        StatusCode::UNAUTHORIZED,
+        error_code::INVALID_CREDENTIALS,
+    )
+    .await;
+    assert!(message.contains("update Hostly"), "{message}");
+
+    let bad_requests = [
+        // A derived key without a vault key, and the other way around.
+        NewAccount {
+            credentials: derived(&unique_email(), login_key),
+            vault_key: None,
+        },
+        NewAccount {
+            credentials: credentials(&unique_email(), PASSWORD),
+            vault_key: Some(sealed('v')),
+        },
+        NewAccount {
+            credentials: derived(&unique_email(), login_key),
+            vault_key: Some("not sealed".into()),
+        },
+        NewAccount {
+            credentials: Credentials {
+                key_version: 7,
+                ..derived(&unique_email(), login_key)
+            },
+            vault_key: Some(sealed('v')),
+        },
+    ];
+    for request in bad_requests {
+        let response = api.post("/accounts", None, &request).await;
+        expect_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            error_code::INVALID,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_plain_account_asked_for_a_derived_key_is_told_without_a_failure() {
+    let api = api!(LoginLimits {
+        address_failures: 1,
+        ..LoginLimits::default()
+    });
+    let email = api.new_account().await.account.email;
+    for _ in 0..3 {
+        let response = api
+            .request(reqwest::Method::POST, "/sessions", None)
+            .header("x-forwarded-for", "203.0.113.9")
+            .json(&derived(&email, "some-derived-login-key-0123456789"))
+            .send()
+            .await
+            .unwrap();
+        expect_error(response, StatusCode::CONFLICT, error_code::PLAIN_PASSWORD).await;
+    }
+    let response = api.log_in_from("203.0.113.9", &email, PASSWORD).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "nothing counted as failed"
+    );
+}
+
+#[tokio::test]
+async fn changing_the_password_upgrades_the_account_and_keeps_sessions() {
+    let api = api!();
+    let session = api.new_account().await;
+    let email = session.account.email.clone();
+    let token = session.token.as_str();
+    let key_one = "first-derived-login-key-0123456789abcdef";
+    let key_two = "second-derived-login-key-0123456789abcdef";
+
+    // Upgrade from the plain password.
+    let wrong = PasswordChange {
+        current_password: "not the password".into(),
+        current_key_version: KEY_VERSION_PLAIN,
+        new_password: key_one.into(),
+        vault_key: sealed('a'),
+    };
+    let response = api.put("/account/password", Some(token), &wrong).await;
+    expect_error(
+        response,
+        StatusCode::UNAUTHORIZED,
+        error_code::INVALID_CREDENTIALS,
+    )
+    .await;
+    let upgrade = PasswordChange {
+        current_password: PASSWORD.into(),
+        ..wrong
+    };
+    let response = api.put("/account/password", Some(token), &upgrade).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let response = api.post("/sessions", None, &derived(&email, key_one)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Session>().await.unwrap().vault_key,
+        Some(sealed('a'))
+    );
+    let response = api
+        .post("/sessions", None, &credentials(&email, PASSWORD))
+        .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // A regular change: the current key must be the derived one now.
+    let change = PasswordChange {
+        current_password: key_one.into(),
+        current_key_version: KEY_VERSION_DERIVED,
+        new_password: key_two.into(),
+        vault_key: sealed('b'),
+    };
+    let response = api.put("/account/password", Some(token), &change).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = api.post("/sessions", None, &derived(&email, key_two)).await;
+    assert_eq!(
+        response.json::<Session>().await.unwrap().vault_key,
+        Some(sealed('b'))
+    );
+    // The session that made the changes still works.
+    assert_eq!(
+        api.get("/account", Some(token)).await.status(),
+        StatusCode::OK
+    );
+
+    let short = PasswordChange {
+        current_password: key_two.into(),
+        current_key_version: KEY_VERSION_DERIVED,
+        new_password: "short".into(),
+        vault_key: sealed('c'),
+    };
+    let response = api.put("/account/password", Some(token), &short).await;
+    expect_error(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        error_code::INVALID,
+    )
+    .await;
+    let response = api.put("/account/password", None, &short).await;
+    expect_error(response, StatusCode::UNAUTHORIZED, error_code::UNAUTHORIZED).await;
 }
