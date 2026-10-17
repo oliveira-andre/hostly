@@ -24,7 +24,7 @@ cargo test -p hostly-core --test sftp   # one integration file (also: shell_sess
 cargo test -p hostly-core --test sftp upload_then_download_round_trips_a_directory_tree   # one test
 cargo test -p hostly                    # Tauri crate tests (data migration)
 cargo test -p hostly-server             # API, migration and end-to-end sync tests; need TEST_DATABASE_URL (in .env), else they skip
-cargo run -p hostly-server              # sync server on 127.0.0.1:8080, configured from .env (see .env.example)
+cargo run -p hostly-server              # sync server on HOSTLY_BIND, configured from .env (see .env.example)
 npm run server                          # same server in Docker: docker compose up -d --build (PostgreSQL included)
 npm run server:logs / server:stop       # follow its logs / docker compose down (data kept in a volume)
 cargo clippy --workspace --all-targets  # kept at zero warnings
@@ -123,6 +123,7 @@ There are four pieces:
   - Every kind syncs through `/items` (`Kind`, `ItemRecord`, `ItemChange`; data decoded with `Item::decode`). `/hosts` serves the same log limited to hosts for older apps.
   - `Credentials.key_version`: 0 = the password as typed (older apps), 1 = a login key derived on the device. `PUT /account/password` changes the login key and the wrapped vault key, and upgrades accounts from 0.
 - **`crates/hostly-server`** is the self-hosted API: axum and PostgreSQL. It's configured from `.env` (see `.env.example`).
+  - `DATABASE_URL` and `HOSTLY_BIND` are required, with no fallback in the code: the owner doesn't want addresses or domains hardcoded. In Docker the container has no `.env`, so compose passes them. The owner's deploy runs PostgreSQL on the host machine (`host.docker.internal`), not the bundled container.
   - Log-ins are limited in `login_limits.rs`: per client address in memory, and per account in the `failed_logins` and `locked_until` columns. Each repeated lock lasts twice as long; a successful log-in resets it.
   - The client address follows `X-Forwarded-For` only through loopback or private hops. So `app()` must be served with `into_make_service_with_connect_info::<SocketAddr>()`. Tests act as different clients by sending `X-Forwarded-For` from 127.0.0.1.
   - `items.rs` holds the change log (one `items` table, sequence `item_revisions`); `hosts.rs` is the `/hosts` view of it. A derived key sent for a key-version-0 account gets 409 `plainPassword`, which doesn't count as a failure.

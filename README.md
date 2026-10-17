@@ -41,7 +41,7 @@ You only need this to sync hosts between devices. Hostly works without it.
 **With Docker**, which needs no PostgreSQL and no configuration:
 
 ```sh
-npm run server          # docker compose up -d --build: PostgreSQL + API on http://127.0.0.1:8080
+npm run server          # docker compose up -d --build: PostgreSQL + API, published on HOSTLY_PUBLISH
 npm run server:logs     # follow the server's logs
 npm run server:stop     # stop it; the data stays in a Docker volume
 ```
@@ -50,12 +50,13 @@ npm run server:stop     # stop it; the data stays in a Docker volume
 
 ```sh
 createdb hostly_development          # once, with PostgreSQL running
-cp .env.example .env                 # once; set DATABASE_URL to that database
-cargo run -p hostly-server           # applies migrations, serves http://127.0.0.1:8080
+cp .env.example .env                 # once; set DATABASE_URL to that database, and HOSTLY_BIND
+cargo run -p hostly-server           # applies migrations, listens on HOSTLY_BIND
 ```
 
-Only run one of them, since both use port 8080. Check either with
-`curl http://127.0.0.1:8080/health`, which should answer `ok`.
+Check either with `curl http://<address>/health`, using the address from `HOSTLY_PUBLISH` or
+`HOSTLY_BIND`; it should answer `ok`. With the values from `.env.example` both use the same port,
+so run only one of them.
 
 Then, in Hostly, click the profile icon at the top right and choose **Create account** (or
 **Log in**). The app already knows the server address, from `HOSTLY_SERVER_URL` in `.env`. To use
@@ -75,9 +76,9 @@ Installers are written to `target/release/bundle/`:
 | Windows | `msi/*.msi`, `nsis/*-setup.exe` |
 | Linux | `deb/*.deb`, `rpm/*.rpm`, `appimage/*.AppImage` |
 
-The builds aren't code-signed yet:
-- **macOS:** right-click the app, choose **Open**, then confirm.
-- **Windows:** in the SmartScreen warning, choose **More info → Run anyway**.
+These builds aren't signed, so after each update macOS asks again for keychain access to every
+saved password. For the copy you'll use every day, follow
+[Deploy to production](#deploy-to-production).
 
 ### 5. Check your changes
 
@@ -92,7 +93,140 @@ npm run check:linux                     # everything above on Linux, in Docker (
 
 - **`cargo: command not found`:** run `source "$HOME/.cargo/env"` or open a new terminal.
 - **`Port 1420 is already in use`:** another `npm run tauri dev` is still running. Stop it first.
-- **macOS asks for Keychain access after a rebuild:** development builds are unsigned, so macOS treats each rebuild as a new app. Choose **Always Allow**. Your saved passwords are not lost.
+- **macOS asks for Keychain access after a rebuild:** development builds are unsigned, so macOS treats each rebuild as a new app. Choose **Always Allow**. Your saved passwords are not lost. A signed release build asks only once; see [Deploy to production](#deploy-to-production).
+
+## Deploy to production
+
+These steps build a signed release of the app, install it, and point it at your hosted sync
+server. They're for macOS; [Windows and Linux](#windows-and-linux) follow at the end.
+
+### 1. Deploy the sync server (optional)
+
+Skip this if you don't sync between devices. Otherwise deploy the server first, as in
+[Sync server → Deploy](#deploy), and check that `curl https://<HOSTLY_DOMAIN>/health` answers
+`ok`, with the domain from the server's `.env`.
+
+### 2. Build your server into the app
+
+In `.env` at the repository root, set `HOSTLY_SERVER_URL` to your server, the same domain as
+`HOSTLY_DOMAIN` in the server's `.env`:
+
+```sh
+HOSTLY_SERVER_URL=https://<HOSTLY_DOMAIN>
+```
+
+The build makes it the app's default server. A Mac that already chose a server in Settings keeps
+that one. Skip this if you don't sync.
+
+### 3. Set the version
+
+Raise `version` in `src-tauri/tauri.conf.json`, for example to `0.2.0`. The installer is named
+after it (`Hostly_0.2.0_aarch64.dmg`). Keep `package.json` and `src-tauri/Cargo.toml` at the same
+version.
+
+### 4. Run the checks
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets
+npx tsc --noEmit
+```
+
+All three should pass before you build.
+
+### 5. Find your signing identity
+
+macOS remembers **Always Allow** on a keychain prompt for one app signature. An unsigned build
+counts as a new app after every update, so macOS asks again for each saved password. A build
+signed with your certificate keeps those answers across updates.
+
+List the code-signing certificates on this Mac:
+
+```sh
+security find-identity -v -p codesigning
+```
+
+```
+  1) 0123456789ABCDEF0123456789ABCDEF01234567 "Apple Development: Your Name (ABCDE12345)"
+     1 valid identities found
+```
+
+The quoted text is your signing identity. If the list is empty, create one in Xcode: **Xcode →
+Settings → Accounts**, add your Apple ID, then **Manage Certificates… → + → Apple Development**. A
+free Apple ID is enough.
+
+An Apple Development certificate is right for your own Macs. To hand Hostly to other people, use a
+**Developer ID Application** certificate (paid Apple Developer Program) and notarize the app; see
+Tauri's [macOS signing guide](https://tauri.app/distribute/sign/macos/).
+
+### 6. Build the signed app
+
+Pass the identity in the environment. Don't put it in `tauri.conf.json`: that file is committed,
+and CI builds with it on machines that don't have your certificate.
+
+```sh
+APPLE_SIGNING_IDENTITY="Apple Development: Your Name (ABCDE12345)" npm run tauri build
+```
+
+This takes several minutes. macOS may ask to let `codesign` use your key; choose **Always Allow**.
+A warning that notarization was skipped is expected. The results:
+
+- `target/release/bundle/dmg/Hostly_<version>_aarch64.dmg` (`x64` instead of `aarch64` on Intel Macs)
+- `target/release/bundle/macos/Hostly.app`
+
+### 7. Check the signature
+
+```sh
+codesign -dv --verbose=2 target/release/bundle/macos/Hostly.app 2>&1 | grep -E "^(Authority|TeamIdentifier|Signature)="
+```
+
+Expect `Authority=Apple Development: Your Name (ABCDE12345)` and `TeamIdentifier=ABCDE12345`.
+`Signature=adhoc` means the build isn't signed: check the identity's spelling and build again.
+
+### 8. Install it
+
+1. Quit `npm run tauri dev` if it's running. The installed app uses the same data folder and
+   keychain entries as the dev build, so don't run both at once.
+2. Open the `.dmg` and drag **Hostly** onto **Applications**.
+3. Start Hostly from Applications or Spotlight.
+
+It opens with the hosts, snippets, rules, saved passwords and sync login you already had.
+
+### 9. Answer the keychain prompts once
+
+The dev build saved your passwords, so macOS asks the first time the new app reads each one: the
+sync login when Hostly starts, and a host's password the first time you connect to it or open its
+editor. Choose **Always Allow** and enter your Mac password. That item won't ask again, including
+after updates signed with the same identity.
+
+### 10. Ship an update
+
+1. Raise the version (step 3) and run the checks (step 4).
+2. Build with the same identity (step 6).
+3. Quit Hostly, open the new `.dmg`, and drag **Hostly** onto **Applications**, choosing
+   **Replace**.
+
+The keychain prompts don't come back. A different identity, or a build without one, is a new app
+to macOS, which then asks once more per saved password.
+
+### Opening it on another Mac
+
+A build opens normally on the Mac that built it. Copied or downloaded to another Mac, it's blocked
+on first launch, because it isn't notarized. Try to open it once, then go to **System Settings →
+Privacy & Security** and choose **Open Anyway**.
+
+### Windows and Linux
+
+Build on that OS with `npm run tauri build` after installing its
+[prerequisites](#1-install-the-prerequisites-once). Or download the installers from a run of the
+**CI** workflow on GitHub, under **Artifacts** (`hostly-Windows`, `hostly-Linux`). CI builds have
+no default sync server built in, so choose yours in Settings.
+
+- **Windows:** run the `.msi` or the `-setup.exe`. They aren't signed, so SmartScreen warns: choose
+  **More info → Run anyway**. Saved passwords go to Credential Manager, which doesn't ask per app.
+- **Linux:** install the `.deb` with `sudo apt install ./Hostly_<version>_amd64.deb`, or the `.rpm`
+  with `sudo dnf install ./Hostly-<version>-1.x86_64.rpm`, or make the `.AppImage` executable and
+  run it. Saving passwords needs a Secret Service such as GNOME Keyring or KWallet.
 
 ## Run only the app against your hosted server
 
@@ -102,9 +236,9 @@ your computer only needs the app: no PostgreSQL and no Docker.
 1. Install the prerequisites from step 1 (except PostgreSQL), then start the app as in step 2.
    An installer built with `npm run tauri build` works the same way.
 2. Point the app at your server, either:
-   - **In the app:** click the cog icon, enter `https://sync.example.com`, choose **Test
+   - **In the app:** click the cog icon, enter `https://<HOSTLY_DOMAIN>`, choose **Test
      connection**, then **Save**. This device remembers it.
-   - **Built in:** set `HOSTLY_SERVER_URL=https://sync.example.com` in `.env` before
+   - **Built in:** set `HOSTLY_SERVER_URL=https://<HOSTLY_DOMAIN>` in `.env` before
      `npm run tauri dev` or `npm run tauri build`. Every app you build then defaults to that server,
      which is handy for installers you hand to your other machines. Settings can still override it.
 3. Click the profile icon, then **Create account** or **Log in**.
@@ -196,18 +330,19 @@ upgraded by logging in with this version; after that they need updating to log i
 ### Configuration
 
 Everything is read from environment variables or from `.env` at the repository root. Copy
-`.env.example` to `.env`; `.env` is git-ignored. All the settings have local defaults, so
-`npm run server` works without a `.env`.
+`.env.example` to `.env`; `.env` is git-ignored. The server itself has no built-in address or
+database: it refuses to start without `DATABASE_URL` and `HOSTLY_BIND`. A container has no `.env`,
+so in Docker those reach the server through `docker-compose.yml` and the Dockerfile.
 
 | Variable | Used by | Meaning |
 |---|---|---|
-| `HOSTLY_SERVER_URL` | app build | The app's default sync server, built in by `npm run tauri dev`/`build`. You can change it in Settings (cog icon). |
-| `DATABASE_URL` | `cargo run` | `postgres://USER:PASSWORD@HOST:PORT/DATABASE`. Required for `cargo run`. Append `?sslmode=require` for hosted PostgreSQL. |
-| `HOSTLY_BIND` | `cargo run` | Listen address. Default `127.0.0.1:8080`; the Docker image uses `0.0.0.0:8080`. |
+| `HOSTLY_SERVER_URL` | app build | The app's default sync server, built in by `npm run tauri dev`/`build`: `https://<HOSTLY_DOMAIN>` for a hosted server. You can change it in Settings (cog icon). |
+| `DATABASE_URL` | server | Required. `postgres://USER:PASSWORD@HOST:PORT/DATABASE`. Append `?sslmode=require` for hosted PostgreSQL. From a container, PostgreSQL on the host machine is at `host.docker.internal`. |
+| `HOSTLY_BIND` | server | Required. Listen address, `IP:PORT`. `127.0.0.1` accepts only this machine; inside a container use `0.0.0.0`. The Dockerfile sets it for the image. |
 | `RUST_LOG` | both | Log filter. Default `hostly_server=info,tower_http=info`. |
 | `TEST_DATABASE_URL` | tests | A disposable database for `cargo test -p hostly-server`. When it's unset, the database tests are skipped. |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | The bundled database. Each defaults to `hostly`; **set a strong password on a public server**. |
-| `HOSTLY_PUBLISH` | compose | Where the API is published. Default `127.0.0.1:8080`. |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | compose | The bundled database. Each defaults to `hostly`; **set a strong password on a public server**. Unused with PostgreSQL on the host machine. |
+| `HOSTLY_PUBLISH` | compose | Where the API is published on the machine running compose. |
 | `HOSTLY_DOMAIN` | compose | Your domain, for automatic HTTPS with `--profile https`. |
 
 ### Run it locally
@@ -217,31 +352,76 @@ without, it's `cargo run -p hostly-server` with your own PostgreSQL.
 
 ### Deploy
 
-On the machine that will host the API, with Docker installed and this repository checked out:
+On the machine that will host the API, with Docker installed and this repository checked out.
+PostgreSQL either runs in Docker next to the API (the bundled one), or is already installed on
+that machine.
+
+**With the bundled PostgreSQL:**
 
 1. Create `.env` with a strong database password and your domain:
    ```sh
    POSTGRES_PASSWORD=<long random URL-safe password>
-   HOSTLY_DOMAIN=sync.example.com
+   HOSTLY_DOMAIN=<your domain>
    ```
 2. Point the domain's DNS at that machine and open ports 80 and 443.
 3. Start PostgreSQL, the API and Caddy, which gets and renews the HTTPS certificate automatically:
    ```sh
    docker compose --profile https up -d --build
    ```
-4. Check it from anywhere with `curl https://sync.example.com/health`, which should answer `ok`.
-   Then point the apps at `https://sync.example.com` (see
+4. Check it from anywhere with `curl https://<HOSTLY_DOMAIN>/health`, which should answer `ok`.
+   Then point the apps at `https://<HOSTLY_DOMAIN>` (see
    [Run only the app](#run-only-the-app-against-your-hosted-server)).
 
-**Without the `https` profile**, the API is only published on `127.0.0.1:8080` of that machine.
-Use that if you already run a reverse proxy there. Keep plain HTTP off the public internet, because
-anyone who sees the traffic could reuse the login key to read your synced hosts (though not your
-passwords, which stay encrypted). The database is never published. Its data
-lives in the `postgres-data` volume and survives `docker compose down` (`down -v` deletes it).
+**With PostgreSQL on the host machine:**
+
+1. Create the database and its user:
+   ```sh
+   sudo -u postgres createuser --pwprompt hostly
+   sudo -u postgres createdb --owner hostly hostly
+   ```
+2. On Linux, let containers reach PostgreSQL. They connect from Docker's networks, not from
+   localhost. Docker Desktop (macOS, Windows) already forwards to the host's localhost, so skip this
+   step there.
+   - In `postgresql.conf`, set `listen_addresses = '*'`, and keep port 5432 closed in the firewall.
+   - In `pg_hba.conf`, allow Docker's address range:
+     ```
+     host  hostly  hostly  172.16.0.0/12  scram-sha-256
+     ```
+   - Restart PostgreSQL: `sudo systemctl restart postgresql`.
+3. Create `.env` with the database and your domain. Inside the container, `localhost` would be the
+   container itself, so the host is `host.docker.internal`:
+   ```sh
+   DATABASE_URL=postgres://hostly:<password>@host.docker.internal:5432/hostly
+   HOSTLY_DOMAIN=<your domain>
+   ```
+4. Check that `docker-compose.yml` hands that to the `server` service, with no `depends_on` on the
+   bundled `postgres`:
+   ```yaml
+   server:
+     environment:
+       DATABASE_URL: ${DATABASE_URL}
+     extra_hosts:
+       - "host.docker.internal:host-gateway"   # Linux; harmless elsewhere
+   ```
+5. Point the domain's DNS at that machine and open ports 80 and 443.
+6. Start only the API and Caddy, leaving the bundled PostgreSQL stopped:
+   ```sh
+   docker compose up -d --build server caddy
+   ```
+7. `docker compose logs server` should show `listening on http://0.0.0.0:<port>`.
+   Then check `curl https://<HOSTLY_DOMAIN>/health` as above.
+
+**Without Caddy**, the API is only published on `HOSTLY_PUBLISH` of that machine. Use that if you
+already run a reverse proxy there. Keep plain HTTP off the public internet, because anyone who sees
+the traffic could reuse the login key to read your synced hosts (though not your passwords, which
+stay encrypted). Caddy forwards to the port in `deploy/Caddyfile`, so keep it the same as the
+container's `HOSTLY_BIND`. The bundled database is never published. Its data lives in the
+`postgres-data` volume and survives `docker compose down` (`down -v` deletes it).
 
 You can also build the image on its own:
 `docker build -f crates/hostly-server/Dockerfile -t hostly-server .` and run it with
-`-e DATABASE_URL=… -p 127.0.0.1:8080:8080`.
+`-e DATABASE_URL=… -p 127.0.0.1:<port>:<port>`, where `<port>` is the one in the image's
+`HOSTLY_BIND`.
 
 Migrations are embedded in the binary and run on startup. The API is documented in
 `crates/hostly-protocol/src/lib.rs`.

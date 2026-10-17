@@ -48,7 +48,7 @@ export class SettingsPage {
       name: "server",
       spellcheck: false,
       value: settings.syncServer ?? "",
-      placeholder: settings.defaultSyncServer ?? "https://sync.example.com",
+      placeholder: settings.defaultSyncServer ?? "https://",
     });
     input.autocomplete = "off";
     label.append("Server address", input);

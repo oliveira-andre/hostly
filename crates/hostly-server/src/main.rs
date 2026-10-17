@@ -5,7 +5,6 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_LOG: &str = "hostly_server=info,tower_http=info";
 
 #[tokio::main]
@@ -20,7 +19,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url =
         std::env::var("DATABASE_URL").map_err(|_| "DATABASE_URL is not set; see .env.example")?;
-    let bind = std::env::var("HOSTLY_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
+    let bind =
+        std::env::var("HOSTLY_BIND").map_err(|_| "HOSTLY_BIND is not set; see .env.example")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
