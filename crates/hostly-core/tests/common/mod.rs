@@ -554,6 +554,8 @@ impl russh_sftp::server::Handler for FsSftp {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).map_err(status)?;
         }
+        #[cfg(not(unix))]
+        let _ = (path, attrs);
         Ok(ok(id))
     }
 

@@ -78,6 +78,7 @@ mod tests {
     use super::*;
     use crate::Error;
 
+    #[cfg(unix)]
     fn names(entries: &[FileEntry]) -> Vec<&str> {
         entries.iter().map(|e| e.name.as_str()).collect()
     }
